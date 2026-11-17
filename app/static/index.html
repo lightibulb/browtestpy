@@ -1,24 +1,313 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <title>Anonymity Verifier - API is live</title>
-  <style>
-    body { font-family: ui-sans-serif, system-ui, sans-serif; max-width: 40rem;
-           margin: 4rem auto; padding: 0 1.5rem; line-height: 1.6; color: #111; }
-    code { background: #f2f2f2; padding: 0.15rem 0.35rem; border-radius: 4px; }
-    a { color: #1f6feb; }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LeakGuard - Anonymity Test</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: ui-sans-serif, system-ui, sans-serif; max-width: 900px;
+         margin: 2rem auto; padding: 0 1rem; background: #f6f7f9; color: #111; }
+  h1 { margin-bottom: 0.25rem; }
+  .subtitle { color: #666; margin-top: 0; }
+  .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px;
+          padding: 1.25rem; margin: 1rem 0; box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
+  .card h2 { margin-top: 0; font-size: 1.15rem; }
+  .card h3 { font-size: 1rem; margin: 1rem 0 0.5rem 0; color: #374151; }
+  label { display: block; margin-bottom: 0.4rem; font-weight: 500; }
+  input { width: 100%; max-width: 460px; padding: 0.55rem; border: 1px solid #d1d5db;
+          border-radius: 6px; font-size: 1rem; }
+  button { padding: 0.6rem 1.25rem; font-size: 1rem; cursor: pointer;
+           background: #1f6feb; color: #fff; border: none; border-radius: 6px;
+           margin-top: 0.75rem; }
+  button:disabled { background: #9ca3af; cursor: not-allowed; }
+  button.secondary { background: #6b7280; }
+  .status { color: #6b7280; margin-top: 0.75rem; font-style: italic; }
+  .status.running { color: #1f6feb; font-style: normal; }
+  .status.done { color: #16a34a; font-style: normal; font-weight: 500; }
+  .status.error { color: #dc2626; font-style: normal; font-weight: 500; }
+  .scorebox { display: flex; align-items: center; gap: 1rem; margin-bottom: 1rem;
+              padding: 1rem; border-radius: 8px; background: #f9fafb; }
+  .score { font-size: 2.5rem; font-weight: 700; line-height: 1; }
+  .score.pass { color: #16a34a; } .score.review { color: #d97706; }
+  .score.fail { color: #dc2626; }
+  .verdict { font-size: 1.25rem; font-weight: 600; }
+  .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px;
+           font-size: 0.75rem; font-weight: 600; text-transform: uppercase;
+           margin-right: 0.4rem; }
+  .badge.critical { background: #fee2e2; color: #991b1b; }
+  .badge.warning  { background: #fef3c7; color: #92400e; }
+  .badge.info     { background: #e0e7ff; color: #3730a3; }
+  .finding { padding: 0.6rem 0; border-bottom: 1px solid #f3f4f6; }
+  .finding:last-child { border-bottom: none; }
+  .finding-title { font-weight: 600; }
+  .finding-detail { color: #555; font-size: 0.9rem; margin-top: 0.15rem; }
+  table { width: 100%; border-collapse: collapse; margin: 0.5rem 0; }
+  td { padding: 0.4rem 0.6rem; border-bottom: 1px solid #f3f4f6;
+       font-size: 0.925rem; vertical-align: top; }
+  td:first-child { font-weight: 500; color: #374151; width: 42%; }
+  td:last-child { font-family: ui-monospace, SFMono-Regular, monospace; color: #111;
+                  word-break: break-all; }
+  pre { background: #f9fafb; border: 1px solid #e5e7eb; padding: 0.75rem;
+        border-radius: 6px; overflow: auto; font-size: 0.85rem; }
+  .history-row { padding: 0.45rem 0; border-bottom: 1px solid #f3f4f6;
+                 font-size: 0.9rem; }
+  .history-row:last-child { border-bottom: none; }
+  .history-row a { color: #1f6feb; text-decoration: none; }
+  .history-row a:hover { text-decoration: underline; }
+  details summary { cursor: pointer; color: #1f6feb; margin-top: 1rem; }
+</style>
 </head>
 <body>
-  <h1>Anonymity Verifier</h1>
-  <p>Part 1 scaffold is deployed. The API is responding.</p>
-  <ul>
-    <li><a href="/docs">/docs</a> - interactive OpenAPI docs</li>
-    <li><a href="/health">/health</a> - liveness and worker probe</li>
-    <li><code>POST /api/v1/scan</code> - enqueue a scan</li>
-    <li><code>GET /api/v1/scan/{id}</code> - poll a scan</li>
-  </ul>
-  <p>The full verification UI lands in Part 3.</p>
+  <h1>LeakGuard</h1>
+  <p class="subtitle">Multi-layer anonymity and leak verification.</p>
+
+  <div class="card">
+    <h2>Run a scan</h2>
+    <label for="proxy">Optional proxy URL (leave blank to test the server itself)</label>
+    <input id="proxy" type="text" placeholder="socks5://127.0.0.1:9050">
+    <button id="btn" onclick="runScan()">Scan</button>
+    <p id="status" class="status"></p>
+  </div>
+
+  <div id="results"></div>
+
+  <div class="card">
+    <h2>Local agent report</h2>
+    <p>Run <code>python agent/leakguard_agent.py --report &lt;this-url&gt;</code>
+       on your machine, then paste the returned agent_id here.</p>
+    <input id="agent-id" placeholder="agent_id (or scan_id to attach)">
+    <button class="secondary" onclick="loadAgent()">Load agent report</button>
+    <div id="agent-result"></div>
+  </div>
+
+  <div class="card">
+    <h2>Recent scans</h2>
+    <button class="secondary" onclick="loadHistory()">Refresh</button>
+    <div id="history-list"></div>
+  </div>
+
+<script>
+function setStatus(text, cls) {
+  const s = document.getElementById('status');
+  s.textContent = text;
+  s.className = 'status ' + (cls || '');
+}
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, function(c) {
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+  });
+}
+function row(k, v) { return '<tr><td>' + esc(k) + '</td><td>' + esc(v) + '</td></tr>'; }
+
+async function runScan() {
+  const proxy = document.getElementById('proxy').value.trim() || null;
+  const btn = document.getElementById('btn');
+  btn.disabled = true;
+  setStatus('Submitting...', 'running');
+  document.getElementById('results').innerHTML = '';
+  try {
+    const res = await fetch('/api/v1/scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ proxy_url: proxy }),
+    });
+    if (!res.ok) throw new Error('submit ' + res.status);
+    const data = await res.json();
+    setStatus('Scanning... (' + data.scan_id.slice(0, 8) + ')', 'running');
+    poll(data.scan_id);
+  } catch (e) {
+    setStatus('Error: ' + e.message, 'error');
+    btn.disabled = false;
+  }
+}
+
+async function poll(id) {
+  let n = 0;
+  const t = setInterval(async () => {
+    if (++n > 60) {
+      clearInterval(t);
+      setStatus('Timed out.', 'error');
+      document.getElementById('btn').disabled = false;
+      return;
+    }
+    try {
+      const res = await fetch('/api/v1/scan/' + id);
+      const data = await res.json();
+      if (data.status === 'complete') {
+        clearInterval(t);
+        setStatus('Done.', 'done');
+        document.getElementById('btn').disabled = false;
+        render(data.result, id);
+        loadHistory();
+      } else if (data.status === 'failed') {
+        clearInterval(t);
+        setStatus('Failed: ' + (data.error || 'unknown'), 'error');
+        document.getElementById('btn').disabled = false;
+      }
+    } catch (e) {
+      clearInterval(t);
+      setStatus('Poll error: ' + e.message, 'error');
+      document.getElementById('btn').disabled = false;
+    }
+  }, 2000);
+}
+
+function render(r, scanId) {
+  if (!r) return;
+  const cls = r.verdict === 'PASS' ? 'pass' : r.verdict === 'REVIEW' ? 'review' : 'fail';
+  let h = '<div class="card">';
+  h += '<div class="scorebox"><div class="score ' + cls + '">'
+     + esc(r.score) + '</div><div><div class="verdict">' + esc(r.verdict)
+     + '</div><div style="font-size:0.85rem;color:#666">score out of 100</div></div></div>';
+
+  h += '<h3>Findings</h3>';
+  const fs = r.findings || [];
+  if (fs.length === 0) h += '<p>No findings.</p>';
+  else {
+    for (const f of fs) {
+      h += '<div class="finding">'
+         + '<span class="badge ' + esc(f.severity) + '">' + esc(f.severity) + '</span>'
+         + '<span class="finding-title">' + esc(f.title) + '</span>'
+         + '<div class="finding-detail">' + esc(f.detail) + '</div></div>';
+    }
+  }
+
+  h += '<h3>Layer 1 - Network identity</h3><table>';
+  const ip = (r.layer1 || {}).ip || {};
+  const dns = (r.layer1 || {}).dns || {};
+  const stun = (r.layer1 || {}).stun || {};
+  h += row('Public IPv4', ip.ipv4 || ip.error || 'n/a');
+  h += row('Public IPv6', ip.ipv6 || 'not detected');
+  h += row('DNS resolver IP', dns.resolver_seen_ip || dns.error || dns.reason || 'n/a');
+  h += row('STUN mapped IP', stun.mapped_ip || stun.error || 'n/a');
+  h += '</table>';
+
+  const geo = r.geo || {};
+  if (geo.status === 'ok') {
+    h += '<h3>IP geolocation</h3><table>';
+    h += row('Country', (geo.country || '?') + ' (' + (geo.country_code || '?') + ')');
+    h += row('City', geo.city || 'n/a');
+    h += row('Timezone', geo.timezone || 'n/a');
+    h += row('ISP', geo.isp || 'n/a');
+    h += '</table>';
+  }
+
+  h += '<h3>Layer 2 - Browser fingerprint</h3>';
+  const l2 = r.layer2 || {};
+  if (l2.status === 'skipped') h += '<p>Skipped: ' + esc(l2.reason || 'unavailable') + '</p>';
+  else if (l2.status === 'error') h += '<p>Error: ' + esc(l2.error || 'unknown') + '</p>';
+  else {
+    const fp = l2.fingerprint || {};
+    h += '<table>';
+    h += row('User agent', fp.userAgent || 'n/a');
+    h += row('Language', fp.language || 'n/a');
+    h += row('Timezone', fp.timezone || 'n/a');
+    h += row('Platform', fp.platform || 'n/a');
+    h += row('Screen', (fp.screenWidth || '?') + 'x' + (fp.screenHeight || '?'));
+    h += row('CPU cores', fp.hardwareConcurrency || 'n/a');
+    h += row('Automation flag', fp.webdriver ? 'DETECTED (bot)' : 'clean');
+    if (fp.webgl) {
+      h += row('WebGL vendor', fp.webgl.vendor || 'n/a');
+      h += row('WebGL renderer', fp.webgl.renderer || 'n/a');
+    }
+    h += '</table>';
+  }
+
+  if (r.layer3) {
+    h += '<h3>Layer 3 - Local agent</h3><table>';
+    h += row('Platform', (r.layer3.platform || '?') + ' ' + (r.layer3.platform_version || ''));
+    h += row('Hostname', r.layer3.hostname || 'n/a');
+    h += row('VPN interfaces', (r.layer3.vpn_interfaces || []).join(', ') || 'none');
+    h += row('DNS resolvers', (r.layer3.dns_resolvers || []).join(', ') || 'n/a');
+    h += '</table>';
+    const ifs = r.layer3.interfaces || [];
+    if (ifs.length) {
+      h += '<table>';
+      for (const i of ifs) {
+        h += row(i.name + ' MAC', i.mac + (i.randomized ? ' (randomized)' : ' (permanent)'));
+      }
+      h += '</table>';
+    }
+  }
+
+  h += '<details><summary>Raw JSON</summary><pre>'
+     + esc(JSON.stringify(r, null, 2)) + '</pre></details>';
+  if (scanId) {
+    h += '<button class="secondary" onclick="download(\'' + esc(scanId) + '\')">'
+       + 'Download JSON</button>';
+  }
+  h += '</div>';
+  document.getElementById('results').innerHTML = h;
+}
+
+function download(scanId) {
+  window.location = '/api/v1/scan/' + scanId + '/export';
+}
+
+async function loadAgent() {
+  const id = document.getElementById('agent-id').value.trim();
+  if (!id) return;
+  const out = document.getElementById('agent-result');
+  out.innerHTML = '<p>Loading...</p>';
+  try {
+    const res = await fetch('/api/v1/agent/' + id);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    let h = '<table>';
+    for (const k of ['scan_id', 'platform', 'platform_version', 'hostname']) {
+      if (data[k]) h += row(k, data[k]);
+    }
+    if (data.vpn_interfaces) h += row('VPN interfaces', data.vpn_interfaces.join(', ') || 'none');
+    if (data.dns_resolvers) h += row('DNS resolvers', data.dns_resolvers.join(', ') || 'n/a');
+    h += '</table>';
+    const ifs = data.interfaces || [];
+    if (ifs.length) {
+      h += '<table>';
+      for (const i of ifs) {
+        h += row(i.name + ' MAC', i.mac + (i.randomized ? ' (randomized)' : ' (permanent)'));
+      }
+      h += '</table>';
+    }
+    h += '<details><summary>Raw JSON</summary><pre>'
+       + esc(JSON.stringify(data, null, 2)) + '</pre></details>';
+    out.innerHTML = h;
+  } catch (e) {
+    out.innerHTML = '<p style="color:#dc2626">' + esc(e.message) + '</p>';
+  }
+}
+
+async function loadHistory() {
+  const out = document.getElementById('history-list');
+  try {
+    const res = await fetch('/api/v1/history');
+    const data = await res.json();
+    const scans = data.scans || [];
+    if (scans.length === 0) { out.innerHTML = '<p>No scans yet.</p>'; return; }
+    let h = '';
+    for (const s of scans) {
+      const cls = s.verdict === 'PASS' ? 'pass' : s.verdict === 'REVIEW' ? 'review' : 'fail';
+      h += '<div class="history-row"><a href="#" onclick="loadScan(\''
+         + esc(s.scan_id) + '\');return false">'
+         + esc(s.scan_id.slice(0, 8)) + '</a> &middot; '
+         + '<span class="score ' + cls + '" style="font-size:1rem">'
+         + esc(s.score) + '</span> &middot; '
+         + esc(s.verdict) + ' &middot; '
+         + esc(s.public_ip || 'n/a') + '</div>';
+    }
+    out.innerHTML = h;
+  } catch (e) {
+    out.innerHTML = '<p style="color:#dc2626">' + esc(e.message) + '</p>';
+  }
+}
+
+async function loadScan(id) {
+  const res = await fetch('/api/v1/scan/' + id);
+  const data = await res.json();
+  if (data.status === 'complete') render(data.result, id);
+}
+
+loadHistory();
+</script>
 </body>
 </html>
