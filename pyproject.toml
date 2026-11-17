@@ -1,0 +1,11 @@
+[project]
+name = "anonymity-verifier"
+version = "0.1.0"
+description = "Multi-layer anonymity and leak verification service"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra -q"

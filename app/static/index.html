@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Anonymity Verifier - API is live</title>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, sans-serif; max-width: 40rem;
+           margin: 4rem auto; padding: 0 1.5rem; line-height: 1.6; color: #111; }
+    code { background: #f2f2f2; padding: 0.15rem 0.35rem; border-radius: 4px; }
+    a { color: #1f6feb; }
+  </style>
+</head>
+<body>
+  <h1>Anonymity Verifier</h1>
+  <p>Part 1 scaffold is deployed. The API is responding.</p>
+  <ul>
+    <li><a href="/docs">/docs</a> - interactive OpenAPI docs</li>
+    <li><a href="/health">/health</a> - liveness and worker probe</li>
+    <li><code>POST /api/v1/scan</code> - enqueue a scan</li>
+    <li><code>GET /api/v1/scan/{id}</code> - poll a scan</li>
+  </ul>
+  <p>The full verification UI lands in Part 3.</p>
+</body>
+</html>
