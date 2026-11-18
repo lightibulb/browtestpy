@@ -6,11 +6,12 @@ def _patch_layers(monkeypatch):
     monkeypatch.setattr(orch, "get_public_ip",
         lambda proxy_url=None: {"ipv4": "1.2.3.4", "ipv6": None, "error": None})
     monkeypatch.setattr(orch, "check_dns",
-        lambda: {"status": "ok", "resolver_seen_ip": "1.2.3.4"})
+        lambda proxy_url=None: {"status": "ok", "resolver_seen_ip": "1.2.3.4"})
     monkeypatch.setattr(orch, "check_stun",
-        lambda **kw: {"status": "ok", "mapped_ip": "1.2.3.4"})
+        lambda proxy_url=None, **kw: {"status": "ok", "mapped_ip": "1.2.3.4"})
     monkeypatch.setattr(orch, "collect_fingerprint",
-        lambda proxy_url=None: {"status": "skipped", "reason": "test"})
+        lambda proxy_url=None: {"status": "ok", "source": "server",
+                                "fingerprint": {"webdriver": False, "timezone": "UTC"}})
     monkeypatch.setattr(orch, "geo_lookup", lambda ip: {"status": "skipped"})
     monkeypatch.setattr(orch, "_record_history", lambda *a, **kw: None)
     if hasattr(orch, "_persist_result"):
@@ -25,7 +26,7 @@ def test_execute_full_scan_pass(monkeypatch):
     assert data["verdict"] == "PASS"
     assert data["score"] == 100
     assert data["layer1"]["ip"]["ipv4"] == "1.2.3.4"
-    assert data["layer2"]["status"] == "skipped"
+    assert data["layer2"]["status"] == "ok"
     assert data["geo"]["status"] == "skipped"
     if "proxy_url" in data:
         assert data["proxy_url"] is None
@@ -34,7 +35,7 @@ def test_execute_full_scan_pass(monkeypatch):
 def test_execute_full_scan_fail_on_dns_leak(monkeypatch):
     _patch_layers(monkeypatch)
     monkeypatch.setattr(orch, "check_dns",
-        lambda: {"status": "ok", "resolver_seen_ip": "9.9.9.9"})
+        lambda proxy_url=None: {"status": "ok", "resolver_seen_ip": "9.9.9.9"})
     res = orch.execute_full_scan.apply(kwargs={"proxy_url": None})
     assert res.successful(), res.traceback
     data = res.result

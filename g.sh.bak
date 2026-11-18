@@ -1,0 +1,2930 @@
+#!/usr/bin/env bash
+###############################################################################
+# fix_leakguard.sh  —  LeakGuard / Anonymity Verifier
+# Applies diagnosis findings F1..F9 in one idempotent, reversible operation.
+#
+#   F1  triage only (no code change)
+#   F2  scan measured the SERVER, not the visitor  -> real client-side checks
+#   F3  missing data scored as PASS                -> fail-closed + INCONCLUSIVE
+#   F4  SOCKS proxies dead (socksio missing)       -> httpx[socks]
+#   F5  DNS/STUN not proxy-aware -> fake FAIL      -> honest applicability
+#   F6  scans stuck queued (worker/Redis/timeout)  -> bounded redelivery, plans
+#   F7  front-end polling defects                  -> hardened fetch/poll loop
+#   F8  loopback placeholder -> opaque 422         -> usable UX + real errors
+#   F9  Layer 3 unreachable + global history leak  -> copy/attach + owner scoping
+#
+# Usage:
+#   bash fix_leakguard.sh                 # patch + verify + auto-rollback on fail
+#   bash fix_leakguard.sh --dry-run       # show what would change, touch nothing
+#   bash fix_leakguard.sh --no-deps       # do not pip install anything
+#   bash fix_leakguard.sh --verify-only   # just run the verification suite
+#   bash fix_leakguard.sh --restore DIR   # roll back to a backup directory
+#
+# Safe on Linux, macOS and Termux. No sed -i, no GNU-only flags.
+###############################################################################
+
+set -Eeuo pipefail
+
+SCRIPT_VERSION="1.0.0"
+REPO="$(pwd)"
+DRY_RUN=0
+RUN_TESTS=1
+INSTALL_DEPS=1
+AUTO_ROLLBACK=1
+VERIFY_ONLY=0
+RESTORE_DIR=""
+PY=""
+
+C_RESET=$'\033[0m'; C_RED=$'\033[31m'; C_GRN=$'\033[32m'
+C_YEL=$'\033[33m'; C_BLU=$'\033[34m'; C_DIM=$'\033[2m'
+if [ ! -t 1 ]; then C_RESET=""; C_RED=""; C_GRN=""; C_YEL=""; C_BLU=""; C_DIM=""; fi
+
+log()  { printf '%s\n' "${C_BLU}==>${C_RESET} $*"; }
+ok()   { printf '%s\n' "${C_GRN} ok${C_RESET} $*"; }
+warn() { printf '%s\n' "${C_YEL}warn${C_RESET} $*" >&2; }
+err()  { printf '%s\n' "${C_RED}FAIL${C_RESET} $*" >&2; }
+die()  { err "$*"; exit 1; }
+
+on_err() {
+  local rc=$? line=${1:-?}
+  err "script aborted at line ${line} (exit ${rc})"
+  err "nothing was half-applied: changes are staged and only committed after verification."
+  exit "$rc"
+}
+trap 'on_err $LINENO' ERR
+
+usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo)         REPO="${2:?--repo needs a path}"; shift 2 ;;
+    --dry-run)      DRY_RUN=1; shift ;;
+    --no-tests)     RUN_TESTS=0; shift ;;
+    --no-deps)      INSTALL_DEPS=0; shift ;;
+    --no-rollback)  AUTO_ROLLBACK=0; shift ;;
+    --verify-only)  VERIFY_ONLY=1; shift ;;
+    --restore)      RESTORE_DIR="${2:?--restore needs a directory}"; shift 2 ;;
+    -h|--help)      usage ;;
+    *)              die "unknown option: $1 (try --help)" ;;
+  esac
+done
+
+REPO="$(cd "$REPO" && pwd)" || die "repo path not readable"
+
+###############################################################################
+# 0. Preflight
+###############################################################################
+log "LeakGuard fix script v${SCRIPT_VERSION}"
+log "Repository: ${REPO}"
+
+if [ -n "${BASH_VERSINFO:-}" ]; then
+  [ "${BASH_VERSINFO[0]}" -ge 4 ] || die "bash >= 4 required (found ${BASH_VERSION})"
+else
+  die "run this with bash, not sh"
+fi
+
+for c in python3 python; do
+  if command -v "$c" >/dev/null 2>&1; then PY="$(command -v "$c")"; break; fi
+done
+[ -n "$PY" ] || die "python3 not found"
+
+"$PY" - <<'PYVER' || die "Python >= 3.11 required (pyproject.toml)"
+import sys
+sys.exit(0 if sys.version_info >= (3, 11) else 1)
+PYVER
+ok "python: $("$PY" -c 'import sys;print(sys.version.split()[0])')"
+
+for marker in app/main.py app/api/routes.py app/services/analyzer.py \
+              app/tasks/orchestrator.py app/static/index.html \
+              requirements.txt render.yaml tests/conftest.py; do
+  [ -f "$REPO/$marker" ] || die "not a LeakGuard repo (missing $marker)"
+done
+ok "repository layout verified"
+
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/leakguard-fix.XXXXXX")"
+STAGE="$WORK/stage"
+mkdir -p "$STAGE"
+cleanup() { rm -rf "$WORK"; }
+trap cleanup EXIT
+
+BACKUP_ROOT="$REPO/.leakguard_fix_backup"
+BACKUP="$BACKUP_ROOT/$(date -u +%Y%m%dT%H%M%SZ)"
+
+emit() { # emit <relpath>   (content on stdin)
+  local rel="$1"
+  mkdir -p "$STAGE/$(dirname "$rel")"
+  cat > "$STAGE/$rel"
+}
+
+###############################################################################
+# Restore mode
+###############################################################################
+restore_from() {
+  local dir="$1"
+  [ -f "$dir/manifest.txt" ] || die "no manifest.txt in $dir"
+  local n=0
+  while IFS='|' read -r rel kind; do
+    [ -n "$rel" ] || continue
+    if [ "$kind" = "NEW" ]; then
+      rm -f "$REPO/$rel"
+    else
+      mkdir -p "$REPO/$(dirname "$rel")"
+      cp -p "$dir/$rel" "$REPO/$rel"
+    fi
+    n=$((n+1))
+  done < "$dir/manifest.txt"
+  ok "restored ${n} file(s) from $dir"
+}
+
+if [ -n "$RESTORE_DIR" ]; then
+  restore_from "$RESTORE_DIR"
+  exit 0
+fi
+
+###############################################################################
+# 1. Full-file rewrites
+###############################################################################
+if [ "$VERIFY_ONLY" -eq 0 ]; then
+log "Staging full-file rewrites"
+
+#------------------------------------------------------------------ analyzer --
+emit app/services/analyzer.py <<'ANALYZER_EOF'
+# Weighted consistency analyzer with explicit measurement coverage.
+#
+# F3: a check that did not run is NOT a clean result. Unmeasured checks emit
+#     findings and force INCONCLUSIVE (or FAIL when the IP itself is unknown).
+# F2: artifacts of the server harness (headless navigator.webdriver, container
+#     timezone) are not reported as user leaks when layer2["source"]=="server".
+# F5: server-side DNS/STUN describe the host, not the visitor. They are only
+#     scored when the server really is the subject of the test.
+from __future__ import annotations
+
+from ipaddress import ip_address
+
+SEVERITY_CRITICAL = "critical"
+SEVERITY_WARNING = "warning"
+SEVERITY_INFO = "info"
+
+SEVERITY_WEIGHTS = {
+    SEVERITY_CRITICAL: 30,
+    SEVERITY_WARNING: 15,
+    SEVERITY_INFO: 5,
+}
+
+VERDICT_PASS = "PASS"
+VERDICT_REVIEW = "REVIEW"
+VERDICT_FAIL = "FAIL"
+VERDICT_INCONCLUSIVE = "INCONCLUSIVE"
+
+
+def _finding(fid, severity, title, detail):
+    return {"id": fid, "severity": severity, "title": title, "detail": detail}
+
+
+def _is_pseudo_interface(iface):
+    # Loopback / virtual bridges / all-zero MACs are not trackable by observers.
+    name_ = (iface.get("name") or "").lower()
+    if (
+        name_ == "lo"
+        or name_.startswith("lo0")
+        or name_.startswith(("veth", "docker", "br-", "virbr", "vmnet", "ifb"))
+    ):
+        return True
+    mac = (iface.get("mac") or "").replace(":", "").replace("-", "").lower()
+    if not mac or set(mac) == {"0"}:
+        return True
+    return False
+
+
+def _is_ip(value):
+    try:
+        ip_address(str(value))
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def _is_public_ip(value):
+    try:
+        a = ip_address(str(value))
+    except (ValueError, TypeError):
+        return False
+    return not (
+        a.is_private or a.is_loopback or a.is_link_local
+        or a.is_reserved or a.is_multicast or a.is_unspecified
+    )
+
+
+def _measure_state(data, value_key):
+    """Return 'ok' | 'missing' | 'n/a'.
+
+    'n/a' means not applicable / not supplied (legacy payloads), which must not
+    be penalised. 'missing' means the check was attempted and produced nothing.
+    """
+    if not data:
+        return "n/a"
+    status = data.get("status")
+    if status in ("error", "skipped"):
+        return "missing"
+    if data.get(value_key):
+        return "ok"
+    if status == "ok":
+        return "missing"
+    return "n/a"
+
+
+MISSING_SPEC = {
+    "ip": ("ip_unknown", SEVERITY_CRITICAL,
+           "Public IP could not be determined"),
+    "dns": ("dns_unmeasured", SEVERITY_WARNING,
+            "DNS leak check did not complete"),
+    "stun": ("stun_unmeasured", SEVERITY_WARNING,
+             "Server STUN check did not complete"),
+    "browser": ("fingerprint_unmeasured", SEVERITY_WARNING,
+                "Browser fingerprint not collected"),
+    "client_webrtc": ("webrtc_unmeasured", SEVERITY_WARNING,
+                      "Browser WebRTC check did not complete"),
+}
+
+
+def analyze(layer1, layer2, geo=None, layer3=None):
+    findings = []
+    layer1 = layer1 or {}
+    layer2 = layer2 or {}
+    geo = geo or {}
+    layer3 = layer3 or {}
+
+    ip_data = layer1.get("ip") or {}
+    dns_data = layer1.get("dns") or {}
+    stun_data = layer1.get("stun") or {}
+    client = layer1.get("client") or {}
+
+    server_ip = ip_data.get("ipv4")
+    server_v6 = ip_data.get("ipv6")
+    client_ip = client.get("public_ip")
+    client_v6 = client.get("public_ipv6")
+    proxy_used = bool(layer1.get("proxy_used"))
+    has_client = bool(client_ip)
+    exit_ip = server_ip if proxy_used else (client_ip or server_ip)
+
+    l2_source = layer2.get("source")
+    harness_browser = l2_source == "server"
+    server_subject = not proxy_used and not has_client
+
+    resolver_ip = dns_data.get("resolver_seen_ip")
+    mapped_ip = stun_data.get("mapped_ip")
+
+    # ---- server-path leaks: only when the server IS the subject -----------
+    if (
+        server_subject
+        and _measure_state(dns_data, "resolver_seen_ip") == "ok"
+        and server_ip and resolver_ip and server_ip != resolver_ip
+    ):
+        findings.append(_finding(
+            "dns_leak", SEVERITY_CRITICAL,
+            "DNS resolver IP differs from public IP",
+            "Public IP " + str(server_ip) + " but resolver seen as " + str(resolver_ip),
+        ))
+
+    if (
+        server_subject
+        and _measure_state(stun_data, "mapped_ip") == "ok"
+        and server_ip and mapped_ip and server_ip != mapped_ip
+    ):
+        findings.append(_finding(
+            "webrtc_leak", SEVERITY_CRITICAL,
+            "STUN/WebRTC leak detected",
+            "Public IP " + str(server_ip) + " but STUN sees " + str(mapped_ip),
+        ))
+
+    # ---- client-path WebRTC: the real browser leak test -------------------
+    if has_client and client.get("webrtc_status") == "ok":
+        cand = [c for c in (client.get("webrtc_ips") or []) if _is_ip(c)]
+        outside = sorted({c for c in cand if _is_public_ip(c) and c != client_ip})
+        lan = sorted({c for c in cand if not _is_public_ip(c)})
+        if outside:
+            findings.append(_finding(
+                "webrtc_leak_client", SEVERITY_CRITICAL,
+                "Browser WebRTC exposes an IP outside your tunnel",
+                "Browser egress " + str(client_ip)
+                + " but WebRTC candidates " + ", ".join(outside),
+            ))
+        if lan:
+            findings.append(_finding(
+                "webrtc_lan_exposed", SEVERITY_WARNING,
+                "Browser WebRTC exposes local network addresses",
+                "Candidates " + ", ".join(lan)
+                + " -- enable mDNS candidate obfuscation in your browser",
+            ))
+
+    # ---- IPv6 -------------------------------------------------------------
+    v6 = client_v6 if has_client else (server_v6 if server_subject else None)
+    if v6:
+        findings.append(_finding(
+            "ipv6_exposed", SEVERITY_WARNING,
+            "IPv6 address exposed",
+            "IPv6 " + str(v6)
+            + " leaked -- if VPN is IPv4-only, this bypasses the tunnel",
+        ))
+
+    # ---- timezone (meaningless for the server harness) --------------------
+    compare_tz = not harness_browser and (
+        l2_source != "client" or has_client or proxy_used
+    )
+    if layer2.get("status") == "ok" and geo.get("status") == "ok" and compare_tz:
+        fp = layer2.get("fingerprint") or {}
+        browser_tz = fp.get("timezone")
+        ip_tz = geo.get("timezone")
+        if browser_tz and ip_tz and browser_tz != ip_tz:
+            findings.append(_finding(
+                "timezone_mismatch", SEVERITY_WARNING,
+                "Browser timezone differs from IP location",
+                "IP in " + str(geo.get("country")) + " (" + str(ip_tz)
+                + ") but browser timezone is " + str(browser_tz),
+            ))
+
+    # ---- automation flag (always true in headless Chromium) ---------------
+    if layer2.get("status") == "ok" and not harness_browser:
+        fp = layer2.get("fingerprint") or {}
+        if fp.get("webdriver"):
+            findings.append(_finding(
+                "webdriver_flag", SEVERITY_INFO,
+                "Browser reports automation flag",
+                "navigator.webdriver is true -- sites may classify this as a bot",
+            ))
+
+    # ---- Layer 3 ----------------------------------------------------------
+    if layer3 and layer3.get("interfaces"):
+        for iface in layer3.get("interfaces", []):
+            if _is_pseudo_interface(iface):
+                continue
+            if iface.get("randomized") is False:
+                findings.append(_finding(
+                    "mac_permanent_" + str(iface.get("name")),
+                    SEVERITY_WARNING,
+                    "Interface " + str(iface.get("name")) + " uses a permanent MAC",
+                    "MAC " + str(iface.get("mac"))
+                    + " is not randomized -- trackable across networks",
+                ))
+
+    if layer3 and not layer3.get("vpn_interfaces"):
+        findings.append(_finding(
+            "no_vpn_interface", SEVERITY_INFO,
+            "No VPN interface detected on host",
+            "Expected a tun/wg/utun interface if a VPN is active",
+        ))
+
+    # ---- coverage (F3) ----------------------------------------------------
+    net_applicable = not has_client
+    checks = [
+        ("ip", "ok" if exit_ip else "missing"),
+        ("dns", _measure_state(dns_data, "resolver_seen_ip") if net_applicable else "n/a"),
+        ("stun", _measure_state(stun_data, "mapped_ip") if net_applicable else "n/a"),
+        ("browser", _measure_state(layer2, "fingerprint")),
+        ("client_webrtc",
+         ("ok" if client.get("webrtc_status") == "ok" else "missing") if has_client else "n/a"),
+    ]
+
+    detail_for = {
+        "ip": ip_data.get("error") or client.get("error") or "no answer from IP providers",
+        "dns": dns_data.get("error") or dns_data.get("reason") or "resolver not reachable",
+        "stun": stun_data.get("error") or stun_data.get("reason") or "no STUN response",
+        "browser": layer2.get("error") or layer2.get("reason") or "fingerprint unavailable",
+        "client_webrtc": client.get("webrtc_error") or "ICE gathering failed or was blocked",
+    }
+    for name, state in checks:
+        if state == "missing":
+            fid, severity, title = MISSING_SPEC[name]
+            findings.append(_finding(fid, severity, title, str(detail_for[name])))
+
+    if geo.get("status") == "error":
+        findings.append(_finding(
+            "geo_unavailable", SEVERITY_INFO,
+            "IP geolocation unavailable",
+            geo.get("reason") or "all providers failed",
+        ))
+
+    # ---- score / verdict --------------------------------------------------
+    score = 100
+    for f in findings:
+        score -= SEVERITY_WEIGHTS.get(f["severity"], 0)
+    score = max(0, min(100, score))
+
+    has_critical = any(f["severity"] == SEVERITY_CRITICAL for f in findings)
+    has_warning = any(f["severity"] == SEVERITY_WARNING for f in findings)
+    complete = all(s in ("ok", "n/a") for _, s in checks)
+
+    if has_critical:
+        verdict = VERDICT_FAIL
+    elif not complete:
+        verdict = VERDICT_INCONCLUSIVE
+    elif has_warning:
+        verdict = VERDICT_REVIEW
+    else:
+        verdict = VERDICT_PASS
+
+    return {
+        "findings": findings,
+        "verdict": verdict,
+        "score": score,
+        "coverage": {
+            "complete": complete,
+            "measured": sum(1 for _, s in checks if s == "ok"),
+            "applicable": sum(1 for _, s in checks if s != "n/a"),
+            "checks": [{"name": n, "state": s} for n, s in checks],
+        },
+    }
+ANALYZER_EOF
+
+#-------------------------------------------------------------------- layer1 --
+emit app/tasks/layer1.py <<'LAYER1_EOF'
+# Layer 1: network identity checks (IP, DNS, STUN).
+#
+# F4: SOCKS proxies need httpx[socks]; the error is now explained, not swallowed.
+# F5: DNS and raw-UDP STUN cannot traverse a proxy from the server. When a proxy
+#     is supplied they report 'skipped' instead of measuring the wrong machine.
+from __future__ import annotations
+
+import os
+import socket
+import struct
+from ipaddress import ip_address
+
+import httpx
+
+IPV4_ECHO = "https://api.ipify.org?format=json"
+IPV6_ECHO = "https://api6.ipify.org?format=json"
+
+PROXY_SKIP_REASON = (
+    "Not measurable through a proxy from the server: this would measure the "
+    "host, not your tunnel. Use the browser-side WebRTC check or the local agent."
+)
+
+
+def _valid_ip(value, version=None):
+    try:
+        addr = ip_address(str(value))
+    except (ValueError, TypeError):
+        return None
+    if version is not None and addr.version != version:
+        return None
+    return str(addr)
+
+
+def _explain(exc):
+    msg = str(exc) or exc.__class__.__name__
+    if "socksio" in msg.lower():
+        msg += " -- install httpx[socks] to use SOCKS proxies"
+    return msg
+
+
+def get_public_ip(proxy_url=None):
+    result = {"ipv4": None, "ipv6": None, "error": None, "proxy_used": bool(proxy_url)}
+
+    kwargs = {"timeout": 10.0, "follow_redirects": True}
+    if proxy_url:
+        kwargs["proxy"] = proxy_url
+    try:
+        with httpx.Client(**kwargs) as client:
+            r = client.get(IPV4_ECHO)
+            r.raise_for_status()
+            result["ipv4"] = _valid_ip(r.json().get("ip"), 4)
+            if result["ipv4"] is None:
+                result["error"] = "IP provider returned an invalid IPv4 address"
+    except Exception as exc:
+        result["error"] = _explain(exc)
+
+    v6_kwargs = {"timeout": 5.0, "follow_redirects": True}
+    if proxy_url:
+        v6_kwargs["proxy"] = proxy_url
+    try:
+        with httpx.Client(**v6_kwargs) as client:
+            r = client.get(IPV6_ECHO)
+            r.raise_for_status()
+            result["ipv6"] = _valid_ip(r.json().get("ip"), 6)
+    except Exception:
+        pass
+
+    return result
+
+
+def check_dns(proxy_url=None):
+    if proxy_url:
+        return {"status": "skipped", "proxy_aware": False, "reason": PROXY_SKIP_REASON}
+    try:
+        import dns.resolver
+    except ImportError:
+        return {"status": "skipped", "reason": "dnspython not installed"}
+    try:
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = 3.0
+        resolver.lifetime = 5.0
+        answers = resolver.resolve("whoami.akamai.net", "A", lifetime=5.0)
+        ip = _valid_ip(str(answers[0]), 4)
+        if not ip:
+            return {"status": "error", "error": "resolver returned a non-IPv4 answer"}
+        return {"status": "ok", "resolver_seen_ip": ip, "proxy_aware": False}
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)}
+
+
+def check_stun(server="stun.l.google.com", port=19302, timeout=5.0, proxy_url=None):
+    if proxy_url:
+        return {"status": "skipped", "proxy_aware": False, "reason": PROXY_SKIP_REASON}
+
+    sock = None
+    data = b""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        txn_id = os.urandom(12)
+        msg = struct.pack("!HHI", 0x0001, 0, 0x2112A442) + txn_id
+        sock.sendto(msg, (server, port))
+        data, _ = sock.recvfrom(2048)
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)}
+    finally:
+        if sock is not None:
+            sock.close()
+
+    if len(data) < 20:
+        return {"status": "error", "error": "STUN response too short"}
+
+    msg_type, msg_len, _ = struct.unpack("!HHI", data[:8])
+    if msg_type != 0x0101:
+        return {"status": "error", "error": "unexpected STUN message type"}
+
+    offset = 20
+    end = min(20 + msg_len, len(data))
+    mapped_ip = None
+    mapped_port = None
+
+    while offset + 4 <= end:
+        attr_type, attr_len = struct.unpack("!HH", data[offset:offset + 4])
+        if offset + 4 + attr_len > len(data):
+            break
+        attr_val = data[offset + 4:offset + 4 + attr_len]
+
+        if attr_type == 0x0001 and attr_len >= 8:
+            family = attr_val[1]
+            mapped_port = struct.unpack("!H", attr_val[2:4])[0]
+            if family == 0x01:
+                mapped_ip = ".".join(str(b) for b in attr_val[4:8])
+
+        if attr_type == 0x0020 and attr_len >= 8:
+            family = attr_val[1]
+            xport = struct.unpack("!H", attr_val[2:4])[0]
+            mapped_port = xport ^ 0x2112
+            if family == 0x01:
+                xip = attr_val[4:8]
+                mapped_ip = ".".join(str(b) for b in (
+                    xip[0] ^ 0x21, xip[1] ^ 0x12, xip[2] ^ 0xA4, xip[3] ^ 0x42,
+                ))
+
+        offset += 4 + attr_len
+        if attr_len % 4:
+            offset += 4 - (attr_len % 4)
+
+    if mapped_ip is None:
+        return {"status": "error", "error": "no mapped address in STUN response"}
+    return {"status": "ok", "mapped_ip": mapped_ip, "mapped_port": mapped_port}
+LAYER1_EOF
+
+#-------------------------------------------------------------------- layer2 --
+emit app/tasks/layer2.py <<'LAYER2_EOF'
+# Layer 2: browser fingerprint collection via Playwright (SERVER fallback).
+#
+# F2: results are tagged source="server" so the analyzer does not report the
+#     harness's own webdriver flag / container timezone as user leaks.
+# F4: socks5h is normalised and proxy credentials are split out for Chromium.
+# F6: launch args trimmed for small (512 MB) workers.
+from __future__ import annotations
+
+from urllib.parse import unquote, urlparse
+
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+
+FINGERPRINT_JS = (
+    "() => { "
+    "const c = document.createElement('canvas'); "
+    "const ctx = c.getContext('2d'); "
+    "ctx.textBaseline = 'top'; "
+    "ctx.font = '14px Arial'; "
+    "ctx.fillStyle = '#f60'; "
+    "ctx.fillRect(0, 0, 100, 20); "
+    "ctx.fillStyle = '#069'; "
+    "ctx.fillText('fingerprint', 2, 2); "
+    "const canvasHash = c.toDataURL().slice(-50); "
+    "const glCanvas = document.createElement('canvas'); "
+    "const gl = glCanvas.getContext('webgl'); "
+    "let webglInfo = null; "
+    "if (gl) { "
+    "  const dbg = gl.getExtension('WEBGL_debug_renderer_info'); "
+    "  if (dbg) { "
+    "    webglInfo = { "
+    "      vendor: gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL), "
+    "      renderer: gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) "
+    "    }; "
+    "  } "
+    "} "
+    "return { "
+    "  userAgent: navigator.userAgent, "
+    "  language: navigator.language, "
+    "  languages: navigator.languages, "
+    "  platform: navigator.platform, "
+    "  timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, "
+    "  screenWidth: screen.width, "
+    "  screenHeight: screen.height, "
+    "  colorDepth: screen.colorDepth, "
+    "  hardwareConcurrency: navigator.hardwareConcurrency, "
+    "  deviceMemory: navigator.deviceMemory, "
+    "  webdriver: navigator.webdriver, "
+    "  canvasHash: canvasHash, "
+    "  webgl: webglInfo "
+    "}; "
+    "}"
+)
+
+LAUNCH_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--mute-audio",
+    "--renderer-process-limit=2",
+    "--js-flags=--max-old-space-size=192",
+]
+
+
+def split_proxy(proxy_url):
+    """Return (playwright_proxy_dict, error_message)."""
+    if not proxy_url:
+        return None, None
+    p = urlparse(proxy_url)
+    scheme = (p.scheme or "").lower()
+    if scheme == "socks5h":
+        scheme = "socks5"  # Chromium does not understand socks5h
+    if scheme not in ("http", "https", "socks5"):
+        return None, "unsupported proxy scheme for Chromium: " + scheme
+    if not p.hostname:
+        return None, "proxy URL has no host"
+    if scheme == "socks5" and (p.username or p.password):
+        return None, (
+            "Chromium cannot authenticate to SOCKS5 proxies; use an HTTP proxy "
+            "or an unauthenticated local SOCKS5 listener"
+        )
+    server = scheme + "://" + p.hostname
+    if p.port:
+        server += ":" + str(p.port)
+    out = {"server": server}
+    if p.username:
+        out["username"] = unquote(p.username)
+    if p.password:
+        out["password"] = unquote(p.password)
+    return out, None
+
+
+def collect_fingerprint(proxy_url=None):
+    if not PLAYWRIGHT_AVAILABLE:
+        return {"status": "skipped", "source": "server",
+                "reason": "playwright module not installed"}
+
+    proxy, proxy_err = split_proxy(proxy_url)
+    if proxy_err:
+        return {"status": "error", "source": "server", "error": proxy_err}
+
+    browser = None
+    context = None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=LAUNCH_ARGS)
+            ctx_opts = {}
+            if proxy:
+                ctx_opts["proxy"] = proxy
+            context = browser.new_context(**ctx_opts)
+            page = context.new_page()
+            page.set_default_timeout(15000)
+            page.goto("about:blank")
+            fp = page.evaluate(FINGERPRINT_JS)
+            return {"status": "ok", "source": "server", "fingerprint": fp}
+    except Exception as exc:
+        msg = str(exc)
+        if "Executable doesn't exist" in msg or "playwright install" in msg:
+            return {"status": "skipped", "source": "server",
+                    "reason": "Playwright browsers not installed (playwright install chromium)"}
+        return {"status": "error", "source": "server", "error": msg}
+    finally:
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+LAYER2_EOF
+
+#-------------------------------------------------------------- orchestrator --
+emit app/tasks/orchestrator.py <<'ORCH_EOF'
+# Orchestrator: Layer 1 + Layer 2, geo enrichment, verdict.
+#
+# F2: prefers fingerprint/网络 measurements supplied by the visitor's browser.
+# F5: DNS/STUN are proxy-aware (they report 'skipped' rather than lie).
+# F6: bounded redelivery so an OOM-killed task cannot loop forever.
+from __future__ import annotations
+
+import json
+import time
+
+import redis
+from celery import shared_task
+
+from app.core.config import settings
+from app.services.analyzer import analyze
+from app.services.geo import lookup as geo_lookup
+from app.tasks.layer1 import check_dns, check_stun, get_public_ip
+from app.tasks.layer2 import collect_fingerprint
+
+RESULT_TTL = 86400 * 7
+MAX_ATTEMPTS = 2
+
+
+def _client():
+    return redis.from_url(
+        settings.result_backend,
+        socket_connect_timeout=3,
+        socket_timeout=3,
+        health_check_interval=30,
+    )
+
+
+def _attempt_guard(scan_id):
+    """F6: bound broker redelivery. Returns (may_run, attempt_number)."""
+    if not scan_id:
+        return True, 1
+    try:
+        r = _client()
+        n = int(r.incr("scan_attempts:" + scan_id))
+        if n == 1:
+            r.expire("scan_attempts:" + scan_id, 3600)
+        return n <= MAX_ATTEMPTS, n
+    except Exception:
+        return True, 1
+
+
+def _persist_result(scan_id, result):
+    if not scan_id:
+        return
+    try:
+        _client().setex("scan_result:" + scan_id, RESULT_TTL,
+                        json.dumps(result, default=str))
+    except Exception:
+        pass
+
+
+def _record_history(scan_id, summary):
+    # F9: no global history list. The web tier owns per-visitor lists; the
+    # worker only writes the summary keyed by scan id.
+    if not scan_id:
+        return
+    try:
+        _client().setex("scan_summary:" + scan_id, RESULT_TTL, json.dumps(summary))
+    except Exception:
+        pass
+
+
+def _aborted_result(scan_id, attempt, proxy_url):
+    finding = {
+        "id": "scan_aborted",
+        "severity": "critical",
+        "title": "Scan aborted after repeated worker failures",
+        "detail": (
+            "Task was redelivered " + str(max(0, attempt - 1)) + " time(s). "
+            "This usually means the worker was OOM-killed while launching "
+            "Chromium. Give the worker more memory, or keep the browser-side "
+            "checks enabled so no server browser is needed."
+        ),
+    }
+    return {
+        "scan_id": scan_id,
+        "timestamp": time.time(),
+        "proxy_url": proxy_url,
+        "verdict": "FAIL",
+        "score": 0,
+        "findings": [finding],
+        "layer1": {"ip": {}, "dns": {}, "stun": {}, "client": {},
+                   "proxy_used": bool(proxy_url)},
+        "layer2": {"status": "skipped", "source": "server"},
+        "layer3": None,
+        "geo": {"status": "skipped"},
+        "coverage": {"complete": False, "measured": 0, "applicable": 4, "checks": []},
+    }
+
+
+@shared_task(bind=True, name="tasks.execute_full_scan")
+def execute_full_scan(self, proxy_url=None, client_fingerprint=None, client_network=None):
+    scan_id = self.request.id
+
+    may_run, attempt = _attempt_guard(scan_id)
+    if not may_run:
+        aborted = _aborted_result(scan_id, attempt, proxy_url)
+        _persist_result(scan_id, aborted)
+        _record_history(scan_id, {
+            "verdict": aborted["verdict"], "score": aborted["score"],
+            "timestamp": aborted["timestamp"], "public_ip": None,
+        })
+        return aborted
+
+    if client_network:
+        client_net = dict(client_network)
+        client_net.setdefault("status", "ok" if client_net.get("public_ip") else "error")
+    else:
+        client_net = {"status": "skipped", "reason": "no browser measurements supplied"}
+
+    layer1 = {
+        "ip": get_public_ip(proxy_url=proxy_url),
+        "dns": check_dns(proxy_url=proxy_url),
+        "stun": check_stun(proxy_url=proxy_url),
+        "client": client_net,
+        "proxy_used": bool(proxy_url),
+    }
+
+    if client_fingerprint:
+        layer2 = {"status": "ok", "source": "client",
+                  "fingerprint": dict(client_fingerprint)}
+    else:
+        layer2 = collect_fingerprint(proxy_url=proxy_url)
+        layer2.setdefault("source", "server")
+
+    client_ip = client_net.get("public_ip")
+    server_ip = (layer1.get("ip") or {}).get("ipv4")
+    exit_ip = server_ip if proxy_url else (client_ip or server_ip)
+
+    geo = geo_lookup(exit_ip) if exit_ip else {"status": "skipped"}
+    analysis = analyze(layer1, layer2, geo=geo)
+
+    result = {
+        "scan_id": scan_id,
+        "timestamp": time.time(),
+        "proxy_url": proxy_url,
+        "exit_ip": exit_ip,
+        "verdict": analysis["verdict"],
+        "score": analysis["score"],
+        "findings": analysis["findings"],
+        "coverage": analysis.get("coverage"),
+        "layer1": layer1,
+        "layer2": layer2,
+        "layer3": None,
+        "geo": geo,
+    }
+
+    _persist_result(scan_id, result)
+    _record_history(scan_id, {
+        "verdict": result["verdict"],
+        "score": result["score"],
+        "timestamp": result["timestamp"],
+        "public_ip": exit_ip,
+    })
+    return result
+ORCH_EOF
+
+#-------------------------------------------------------------------- routes --
+emit app/api/routes.py <<'ROUTES_EOF'
+# HTTP routes: scan submission, status, history, agent reports, export.
+#
+# F2/F8: accepts browser-side measurements, returns real error details.
+# F9: history and scan reads are scoped to the visitor's identity cookie.
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+import uuid
+from functools import lru_cache
+
+import redis
+from celery.result import AsyncResult
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import Response
+
+from app.core.celery_app import celery
+from app.core.config import settings
+from app.models.scan import AgentReport, ScanRequest, ScanResponse, ScanStatus
+from app.services.analyzer import analyze
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/api/v1", tags=["scans"])
+
+HISTORY_TTL = 86400 * 7
+SCAN_ID_RE = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
+
+
+@lru_cache
+def get_redis():
+    return redis.from_url(
+        settings.result_backend,
+        socket_connect_timeout=2,
+        socket_timeout=2,
+        health_check_interval=30,
+    )
+
+
+def _redis_or_none():
+    # redis.from_url() is lazy: it builds a client, it does not connect.
+    # Reachability is probed by /ready and guarded around every operation.
+    try:
+        return get_redis()
+    except Exception as exc:
+        logger.warning("Redis client could not be created: %s", exc)
+        return None
+
+
+def _check_scan_id(scan_id: str) -> None:
+    if not SCAN_ID_RE.match(scan_id or ""):
+        raise HTTPException(status_code=400, detail="invalid scan_id")
+
+
+def _owner_of(request: Request) -> str | None:
+    return getattr(request.state, "lg_sid", None) or request.cookies.get("lg_sid")
+
+
+def _assert_owner(request: Request, scan_id: str) -> None:
+    if settings.environment != "production":
+        return
+    r = _redis_or_none()
+    if r is None:
+        return
+    try:
+        raw = r.get("scan_owner:" + scan_id)
+    except Exception:
+        return
+    if not raw:
+        return
+    owner = raw.decode() if isinstance(raw, bytes) else str(raw)
+    if owner != (_owner_of(request) or ""):
+        raise HTTPException(status_code=404, detail="Scan not found")
+
+
+def _remember_owner(request: Request, scan_id: str) -> None:
+    owner = _owner_of(request)
+    if not owner:
+        return
+    r = _redis_or_none()
+    if r is None:
+        return
+    try:
+        key = "scan_history:" + owner
+        r.lpush(key, scan_id)
+        r.ltrim(key, 0, 49)
+        r.expire(key, HISTORY_TTL)
+        r.setex("scan_owner:" + scan_id, HISTORY_TTL, owner)
+    except Exception:
+        logger.warning("Could not record scan ownership", exc_info=True)
+
+
+@router.post("/scan", response_model=ScanResponse, status_code=202)
+async def submit_scan(request: Request, payload: ScanRequest) -> ScanResponse:
+    from app.tasks.orchestrator import execute_full_scan
+
+    scan_id = str(uuid.uuid4())
+    kwargs = {"proxy_url": payload.proxy_url}
+    if payload.client_fingerprint is not None:
+        kwargs["client_fingerprint"] = payload.client_fingerprint.model_dump()
+    if payload.client_network is not None:
+        kwargs["client_network"] = payload.client_network.model_dump()
+
+    try:
+        await asyncio.to_thread(
+            execute_full_scan.apply_async, kwargs=kwargs, task_id=scan_id
+        )
+    except Exception:
+        logger.exception("Failed to enqueue scan %s", scan_id)
+        raise HTTPException(status_code=503, detail="Queue unavailable")
+
+    _remember_owner(request, scan_id)
+    return ScanResponse(scan_id=scan_id, status=ScanStatus.QUEUED)
+
+
+def _load_persisted_result(scan_id: str) -> dict | None:
+    r = _redis_or_none()
+    if r is None:
+        return None
+    try:
+        raw = r.get("scan_result:" + scan_id)
+        if raw:
+            return json.loads(raw)
+    except Exception:
+        return None
+    return None
+
+
+def _load_layer3(scan_id: str) -> dict | None:
+    r = _redis_or_none()
+    if r is None:
+        return None
+    try:
+        raw = r.get("agent:" + scan_id)
+        if raw:
+            return json.loads(raw)
+    except Exception:
+        return None
+    return None
+
+
+def _merge_layer3(scan_id: str, base: dict) -> dict:
+    layer3 = _load_layer3(scan_id)
+    if layer3 is None:
+        return base
+    analysis = analyze(
+        base.get("layer1", {}),
+        base.get("layer2", {}),
+        geo=base.get("geo"),
+        layer3=layer3,
+    )
+    merged = dict(base)
+    merged["verdict"] = analysis["verdict"]
+    merged["score"] = analysis["score"]
+    merged["findings"] = analysis["findings"]
+    merged["coverage"] = analysis.get("coverage")
+    merged["layer3"] = layer3
+    return merged
+
+
+@router.get("/scan/{scan_id}", response_model=ScanResponse)
+async def get_scan(request: Request, scan_id: str) -> ScanResponse:
+    _check_scan_id(scan_id)
+    _assert_owner(request, scan_id)
+
+    result = AsyncResult(scan_id, app=celery)
+
+    if result.state == "SUCCESS":
+        base = result.result or {}
+        return ScanResponse(scan_id=scan_id, status=ScanStatus.COMPLETE,
+                            result=_merge_layer3(scan_id, base))
+
+    if result.state in ("STARTED", "RETRY"):
+        return ScanResponse(scan_id=scan_id, status=ScanStatus.RUNNING)
+
+    if result.state == "FAILURE":
+        return ScanResponse(scan_id=scan_id, status=ScanStatus.FAILED,
+                            error=str(result.result) if result.result else "unknown error")
+
+    if result.state == "PENDING":
+        persisted = _load_persisted_result(scan_id)
+        if persisted is not None:
+            return ScanResponse(scan_id=scan_id, status=ScanStatus.COMPLETE,
+                                result=_merge_layer3(scan_id, persisted))
+        return ScanResponse(scan_id=scan_id, status=ScanStatus.QUEUED)
+
+    return ScanResponse(scan_id=scan_id, status=ScanStatus.FAILED,
+                        error="unexpected state: " + str(result.state))
+
+
+@router.get("/scan/{scan_id}/export")
+async def export_scan(request: Request, scan_id: str) -> Response:
+    _check_scan_id(scan_id)
+    _assert_owner(request, scan_id)
+
+    result = AsyncResult(scan_id, app=celery)
+    base = result.result or {} if result.state == "SUCCESS" else _load_persisted_result(scan_id)
+    if not base:
+        raise HTTPException(status_code=404, detail="Scan not complete")
+
+    merged = _merge_layer3(scan_id, base)
+    body = json.dumps(merged, indent=2, default=str)
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={
+            "Content-Disposition": 'attachment; filename="leakguard-' + scan_id[:8] + '.json"'
+        },
+    )
+
+
+@router.post("/agent", status_code=202)
+async def submit_agent(payload: AgentReport):
+    data = payload.model_dump()
+    scan_id = data.pop("scan_id", None) or str(uuid.uuid4())
+    _check_scan_id(scan_id)
+
+    stored = {k: v for k, v in data.items() if v is not None}
+    stored["scan_id"] = scan_id
+
+    r = _redis_or_none()
+    if r is None:
+        raise HTTPException(status_code=503, detail="Storage unavailable")
+    try:
+        r.setex("agent:" + scan_id, HISTORY_TTL, json.dumps(stored))
+    except Exception:
+        logger.exception("Failed to store agent report %s", scan_id)
+        raise HTTPException(status_code=503, detail="Store failed")
+
+    body = {"scan_id": scan_id, "view_url": "/api/v1/agent/" + scan_id}
+    if payload.scan_id and _load_persisted_result(scan_id) is None:
+        body["warning"] = (
+            "No completed scan found with this id yet. The report is stored and "
+            "will merge automatically when that scan finishes."
+        )
+    return body
+
+
+@router.get("/agent/{scan_id}")
+async def get_agent(request: Request, scan_id: str):
+    _check_scan_id(scan_id)
+    _assert_owner(request, scan_id)
+
+    r = _redis_or_none()
+    if r is None:
+        raise HTTPException(status_code=503, detail="Storage unavailable")
+    try:
+        raw = r.get("agent:" + scan_id)
+    except Exception:
+        raise HTTPException(status_code=503, detail="Read failed")
+    if not raw:
+        raise HTTPException(status_code=404, detail="Agent report not found")
+    return json.loads(raw)
+
+
+@router.get("/history")
+async def get_history(request: Request):
+    owner = _owner_of(request)
+    if not owner:
+        return {"scans": []}
+    r = _redis_or_none()
+    if r is None:
+        return {"scans": []}
+    try:
+        ids = r.lrange("scan_history:" + owner, 0, 19)
+    except Exception:
+        return {"scans": []}
+
+    scans = []
+    for raw_id in ids:
+        sid = raw_id.decode() if isinstance(raw_id, bytes) else str(raw_id)
+        try:
+            summary_raw = r.get("scan_summary:" + sid)
+        except Exception:
+            summary_raw = None
+        summary = {}
+        if summary_raw:
+            try:
+                summary = json.loads(summary_raw)
+            except Exception:
+                summary = {}
+        scans.append({
+            "scan_id": sid,
+            "verdict": summary.get("verdict"),
+            "score": summary.get("score"),
+            "timestamp": summary.get("timestamp"),
+            "public_ip": summary.get("public_ip"),
+            "pending": not bool(summary),
+        })
+    return {"scans": scans}
+ROUTES_EOF
+
+#---------------------------------------------------------------------- main --
+emit app/main.py <<'MAIN_EOF'
+# FastAPI entrypoint. Serves the UI at / and the API under /api/v1.
+#
+# F7: polling GETs get their own generous rate bucket; 429 carries Retry-After.
+# F9: every visitor gets an opaque identity cookie used to scope scan history.
+from __future__ import annotations
+
+import logging
+import re
+import uuid
+from collections import defaultdict
+from pathlib import Path
+from threading import Lock
+from time import time
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse, Response
+
+from app import __version__
+from app.api.routes import router
+from app.core.celery_app import celery
+from app.core.config import settings
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+SID_RE = re.compile(r"^[A-Za-z0-9_\-]{8,64}$")
+
+app = FastAPI(
+    title=settings.app_name,
+    version=__version__,
+    description="Multi-layer anonymity and leak verification service.",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class RateLimiter:
+    """In-memory sliding window. Fine for single-instance deployments."""
+
+    def __init__(self, max_requests=60, window_seconds=60):
+        self.max = max_requests
+        self.window = window_seconds
+        self.buckets = defaultdict(list)
+        self.lock = Lock()
+
+    def allow(self, key):
+        now = time()
+        cutoff = now - self.window
+        with self.lock:
+            if len(self.buckets) > 1000:
+                stale = [k for k, ts in self.buckets.items()
+                         if not ts or max(ts) < cutoff]
+                for k in stale:
+                    self.buckets.pop(k, None)
+            bucket = [t for t in self.buckets[key] if t > cutoff]
+            if len(bucket) >= self.max:
+                self.buckets[key] = bucket
+                return False
+            bucket.append(now)
+            self.buckets[key] = bucket
+            return True
+
+    def retry_after(self, key):
+        with self.lock:
+            ts = self.buckets.get(key) or []
+            if not ts:
+                return 1
+            return max(1, int(self.window - (time() - min(ts))) + 1)
+
+
+write_limiter = RateLimiter(max_requests=60, window_seconds=60)
+poll_limiter = RateLimiter(max_requests=300, window_seconds=60)
+limiter = write_limiter  # backwards-compatible alias
+
+
+def _client_key(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for", "")
+    return xff.split(",")[0].strip() or (
+        request.client.host if request.client else "unknown"
+    )
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/api/"):
+        is_poll = request.method == "GET" and (
+            (path.startswith("/api/v1/scan/") and not path.endswith("/export"))
+            or path == "/api/v1/history"
+        )
+        lim = poll_limiter if is_poll else write_limiter
+        if not lim.allow(_client_key(request)):
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Rate limit exceeded (" + str(lim.max) + " req/min)"},
+                headers={"Retry-After": str(lim.retry_after(_client_key(request)))},
+            )
+    return await call_next(request)
+
+
+# Registered last => outermost => request.state.lg_sid exists everywhere.
+@app.middleware("http")
+async def identity_middleware(request: Request, call_next):
+    sid = request.cookies.get("lg_sid")
+    if not sid or not SID_RE.match(sid):
+        sid = uuid.uuid4().hex
+    request.state.lg_sid = sid
+    response = await call_next(request)
+    if request.cookies.get("lg_sid") != sid:
+        response.set_cookie(
+            "lg_sid", sid,
+            max_age=86400 * 30,
+            httponly=True,
+            samesite="lax",
+            secure=(settings.environment == "production"),
+            path="/",
+        )
+    return response
+
+
+app.include_router(router)
+
+
+@app.get("/", include_in_schema=False)
+def serve_ui():
+    index = STATIC_DIR / "index.html"
+    if not index.exists():
+        return {"error": "UI missing", "path": str(index)}
+    return FileResponse(index, headers={"Cache-Control": "no-cache, must-revalidate"})
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return Response(status_code=204)
+
+
+@app.get("/info", tags=["meta"])
+def info() -> dict:
+    return {
+        "app": settings.app_name,
+        "version": __version__,
+        "environment": settings.environment,
+    }
+
+
+_health_lock = Lock()
+_health_ts = 0.0
+_health_value = False
+
+
+def _check_workers() -> bool:
+    global _health_ts, _health_value
+    now = time()
+    with _health_lock:
+        if now - _health_ts < 5.0:
+            return _health_value
+
+    value = False
+    try:
+        from app.api.routes import _redis_or_none
+        r = _redis_or_none()
+        if r is not None:
+            r.ping()  # fail fast instead of hanging inside a broker broadcast
+            value = len(celery.control.ping(timeout=0.5)) > 0
+    except Exception as exc:
+        logger.warning("Celery ping failed: %s", exc)
+        value = False
+
+    with _health_lock:
+        _health_ts = now
+        _health_value = value
+    return value
+
+
+@app.get("/health", tags=["meta"])
+def health() -> dict:
+    return {
+        "status": "ok",
+        "environment": settings.environment,
+        "celery_workers": _check_workers(),
+    }
+
+
+@app.get("/ready", tags=["meta"])
+def ready() -> dict:
+    from app.api.routes import _redis_or_none
+    r = _redis_or_none()
+    redis_ok = False
+    if r is not None:
+        try:
+            r.ping()
+            redis_ok = True
+        except Exception:
+            redis_ok = False
+    body = {"status": "ok" if redis_ok else "degraded", "redis": redis_ok}
+    return JSONResponse(content=body, status_code=200 if redis_ok else 503)
+MAIN_EOF
+ok "staged: analyzer, layer1, layer2, orchestrator, routes, main"
+fi
+
+###############################################################################
+# 2. The UI (F2 / F7 / F8 / F9)
+###############################################################################
+if [ "$VERIFY_ONLY" -eq 0 ]; then
+log "Staging the web interface"
+emit app/static/index.html <<'HTML_EOF'
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LeakGuard - Anonymity Test</title>
+<style>
+* { box-sizing: border-box; }
+body { font-family: ui-sans-serif, system-ui, sans-serif; max-width: 940px;
+  margin: 2rem auto; padding: 0 1rem; background: #f6f7f9; color: #111; }
+h1 { margin-bottom: 0.25rem; }
+.subtitle { color: #666; margin-top: 0; }
+.card { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px;
+  padding: 1.25rem; margin: 1rem 0; box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
+.card h2 { margin-top: 0; font-size: 1.15rem; }
+.card h3 { font-size: 1rem; margin: 1rem 0 0.5rem 0; color: #374151; }
+label { display: block; margin-bottom: 0.4rem; font-weight: 500; }
+input[type=text] { width: 100%; max-width: 520px; padding: 0.55rem;
+  border: 1px solid #d1d5db; border-radius: 6px; font-size: 1rem; }
+.checkline { font-weight: 400; margin: 0.75rem 0 0 0; display: flex;
+  align-items: center; gap: 0.5rem; }
+button { padding: 0.6rem 1.25rem; font-size: 1rem; cursor: pointer;
+  background: #1f6feb; color: #fff; border: none; border-radius: 6px; margin-top: 0.75rem; }
+button:disabled { background: #9ca3af; cursor: not-allowed; }
+button.secondary { background: #6b7280; }
+button.small { padding: 0.25rem 0.6rem; font-size: 0.8rem; margin-top: 0; }
+.hint { color: #6b7280; font-size: 0.85rem; margin: 0.4rem 0 0 0; }
+.notice { background: #eef2ff; border: 1px solid #c7d2fe; color: #3730a3;
+  border-radius: 6px; padding: 0.75rem; font-size: 0.9rem; }
+.status { color: #6b7280; margin-top: 0.75rem; font-style: italic; }
+.status.running { color: #1f6feb; font-style: normal; }
+.status.done { color: #16a34a; font-style: normal; font-weight: 500; }
+.status.error { color: #dc2626; font-style: normal; font-weight: 500; }
+.scanid { display: none; margin-top: 0.6rem; font-size: 0.85rem; color: #374151; }
+.scanid code { background: #f3f4f6; padding: 0.15rem 0.35rem; border-radius: 4px;
+  word-break: break-all; }
+.scorebox { display: flex; align-items: center; gap: 1rem; margin-bottom: 1rem;
+  padding: 1rem; border-radius: 8px; background: #f9fafb; }
+.score { font-size: 2.5rem; font-weight: 700; line-height: 1; }
+.score.pass { color: #16a34a; } .score.review { color: #d97706; }
+.score.fail { color: #dc2626; } .score.inconclusive { color: #6b7280; }
+.verdict { font-size: 1.25rem; font-weight: 600; }
+.cov { font-size: 0.85rem; color: #6b7280; margin: 0.25rem 0 0.5rem 0; }
+.badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px;
+  font-size: 0.75rem; font-weight: 600; text-transform: uppercase; margin-right: 0.4rem; }
+.badge.critical { background: #fee2e2; color: #991b1b; }
+.badge.warning  { background: #fef3c7; color: #92400e; }
+.badge.info     { background: #e0e7ff; color: #3730a3; }
+.finding { padding: 0.6rem 0; border-bottom: 1px solid #f3f4f6; }
+.finding:last-child { border-bottom: none; }
+.finding-title { font-weight: 600; }
+.finding-detail { color: #555; font-size: 0.9rem; margin-top: 0.15rem; }
+table { width: 100%; border-collapse: collapse; margin: 0.5rem 0; }
+td { padding: 0.4rem 0.6rem; border-bottom: 1px solid #f3f4f6;
+  font-size: 0.925rem; vertical-align: top; }
+td:first-child { font-weight: 500; color: #374151; width: 42%; }
+td:last-child { font-family: ui-monospace, SFMono-Regular, monospace; color: #111;
+  word-break: break-all; }
+pre { background: #f9fafb; border: 1px solid #e5e7eb; padding: 0.75rem;
+  border-radius: 6px; overflow: auto; font-size: 0.85rem; }
+.history-row { padding: 0.45rem 0; border-bottom: 1px solid #f3f4f6; font-size: 0.9rem; }
+.history-row:last-child { border-bottom: none; }
+.history-row a { color: #1f6feb; text-decoration: none; }
+.history-row a:hover { text-decoration: underline; }
+details summary { cursor: pointer; color: #1f6feb; margin-top: 1rem; }
+</style>
+</head>
+<body>
+<h1>LeakGuard</h1>
+<p class="subtitle">Multi-layer anonymity and leak verification.</p>
+
+<div class="card">
+  <p class="notice">
+    <strong>What is measured where:</strong> the fingerprint and WebRTC checks run
+    in <em>your</em> browser. The public-IP / DNS / STUN checks run on the
+    <em>server</em> (or through the proxy you supply). Leave the proxy empty to
+    test this server's exit; supply one to test that exit instead.
+  </p>
+</div>
+
+<div class="card">
+  <h2>Run a scan</h2>
+  <label for="proxy">Proxy URL (optional)</label>
+  <input id="proxy" type="text" placeholder="socks5://proxy.example.com:1080" autocomplete="off">
+  <p class="hint">
+    Must be reachable <em>from the server</em>, not from your laptop. In production,
+    loopback and private-range hosts are rejected unless the operator sets
+    ALLOW_PRIVATE_PROXIES=1.
+  </p>
+  <label class="checkline">
+    <input id="use-client" type="checkbox" checked>
+    Use my browser for the fingerprint and WebRTC leak checks (recommended)
+  </label>
+  <button id="btn">Scan</button>
+  <p id="status" class="status"></p>
+  <p id="scanid" class="scanid"></p>
+</div>
+
+<div id="results"></div>
+
+<div class="card">
+  <h2>Local agent report (Layer 3)</h2>
+  <p class="hint">
+    Run the agent on your own machine, then load its report here. After a scan,
+    use “Fill agent field” to attach it to that scan.
+  </p>
+  <input id="agent-id" type="text" placeholder="scan_id (from agent output)">
+  <button class="secondary" id="agent-load">Load agent report</button>
+  <div id="agent-result"></div>
+</div>
+
+<div class="card">
+  <h2>Recent scans (only yours)</h2>
+  <button class="secondary" id="history-refresh">Refresh</button>
+  <div id="history-list"></div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  var API = '/api/v1';
+  var POLL_BUDGET_MS = 300000;
+  var pollToken = 0;
+  var currentScanId = null;
+
+  function $(id) { return document.getElementById(id); }
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  function esc(s) {
+    if (s === undefined || s === null) return '';
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function row(k, v) { return '<tr><td>' + esc(k) + '</td><td>' + esc(v) + '</td></tr>'; }
+  function setStatus(text, cls) {
+    var s = $('status');
+    s.textContent = text;
+    s.className = 'status ' + (cls || '');
+  }
+  function verdictClass(v) {
+    if (v === 'PASS') return 'pass';
+    if (v === 'REVIEW') return 'review';
+    if (v === 'INCONCLUSIVE') return 'inconclusive';
+    return 'fail';
+  }
+
+  function detailMessage(data) {
+    if (!data) return '';
+    var d = data.detail;
+    if (typeof d === 'string') return d;
+    if (Object.prototype.toString.call(d) === '[object Array]') {
+      return d.map(function (x) {
+        if (x && x.msg) return (x.loc ? x.loc.join('.') + ': ' : '') + x.msg;
+        return JSON.stringify(x);
+      }).join('; ');
+    }
+    return '';
+  }
+
+  // F7: every request has a timeout, an ok-check and a real error message.
+  function apiFetch(path, opts, timeoutMs) {
+    opts = opts || {};
+    timeoutMs = timeoutMs || 20000;
+    var ctl = new AbortController();
+    var timer = setTimeout(function () { ctl.abort(); }, timeoutMs);
+    opts.signal = ctl.signal;
+    opts.credentials = 'same-origin';
+    return fetch(path, opts).then(function (res) {
+      clearTimeout(timer);
+      return res.text().then(function (text) {
+        var data = null;
+        try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
+        if (!res.ok) {
+          var err = new Error(detailMessage(data) || ('HTTP ' + res.status));
+          err.status = res.status;
+          err.retryAfter = parseInt(res.headers.get('Retry-After') || '0', 10);
+          throw err;
+        }
+        if (data === null) throw new Error('Server returned a non-JSON response');
+        return data;
+      });
+    }, function (e) {
+      clearTimeout(timer);
+      if (e && e.name === 'AbortError') throw new Error('Request timed out');
+      throw new Error('Network error: ' + (e && e.message ? e.message : e));
+    });
+  }
+
+  // ---------------- F2: measurements taken in the visitor's browser ---------
+  function collectClientFingerprint() {
+    var fp = {
+      userAgent: navigator.userAgent,
+      language: navigator.language,
+      languages: navigator.languages ? Array.prototype.slice.call(navigator.languages, 0, 8) : [],
+      platform: navigator.platform,
+      timezone: (Intl.DateTimeFormat().resolvedOptions() || {}).timeZone,
+      screenWidth: screen.width,
+      screenHeight: screen.height,
+      colorDepth: screen.colorDepth,
+      hardwareConcurrency: navigator.hardwareConcurrency,
+      deviceMemory: navigator.deviceMemory,
+      webdriver: !!navigator.webdriver,
+      canvasHash: null,
+      webgl: null
+    };
+    try {
+      var c = document.createElement('canvas');
+      var ctx = c.getContext('2d');
+      ctx.textBaseline = 'top';
+      ctx.font = '14px Arial';
+      ctx.fillStyle = '#f60';
+      ctx.fillRect(0, 0, 100, 20);
+      ctx.fillStyle = '#069';
+      ctx.fillText('fingerprint', 2, 2);
+      fp.canvasHash = c.toDataURL().slice(-50);
+    } catch (e) { /* canvas blocked */ }
+    try {
+      var gl = document.createElement('canvas').getContext('webgl');
+      if (gl) {
+        var dbg = gl.getExtension('WEBGL_debug_renderer_info');
+        if (dbg) {
+          fp.webgl = {
+            vendor: gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL),
+            renderer: gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)
+          };
+        }
+      }
+    } catch (e) { /* webgl blocked */ }
+    return fp;
+  }
+
+  function collectClientIp() {
+    var ctl = new AbortController();
+    var t = setTimeout(function () { ctl.abort(); }, 6000);
+    return fetch('https://api.ipify.org?format=json', { signal: ctl.signal })
+      .then(function (r) { clearTimeout(t); return r.json(); })
+      .then(function (j) { return j && j.ip ? j.ip : null; })
+      .catch(function () { clearTimeout(t); return null; });
+  }
+
+  function collectWebRtcIps(timeoutMs) {
+    return new Promise(function (resolve) {
+      var out = { ips: [], mdns: false, status: 'error', error: null };
+      var settled = false;
+      var pc = null;
+      var timer = null;
+      function finish() {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        try { if (pc) pc.close(); } catch (e) {}
+        resolve(out);
+      }
+      var RTC = window.RTCPeerConnection || window.webkitRTCPeerConnection;
+      if (!RTC) {
+        out.status = 'skipped';
+        out.error = 'WebRTC unavailable in this browser';
+        return finish();
+      }
+      try {
+        pc = new RTC({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+      } catch (e) {
+        out.status = 'skipped';
+        out.error = String(e);
+        return finish();
+      }
+      timer = setTimeout(function () {
+        if (out.ips.length || out.mdns) out.status = 'ok';
+        else out.error = 'no ICE candidates gathered (STUN blocked?)';
+        finish();
+      }, timeoutMs || 4000);
+      pc.onicecandidate = function (ev) {
+        if (!ev.candidate) { out.status = 'ok'; return finish(); }
+        var parts = (ev.candidate.candidate || '').split(' ');
+        var addr = parts[4];
+        if (!addr) return;
+        if (/\.local$/i.test(addr)) { out.mdns = true; return; }
+        if (/^[0-9.]+$/.test(addr) || addr.indexOf(':') >= 0) {
+          if (out.ips.indexOf(addr) < 0) out.ips.push(addr);
+        }
+      };
+      try {
+        pc.createDataChannel('leakguard');
+        pc.createOffer()
+          .then(function (o) { return pc.setLocalDescription(o); })
+          .catch(function (e) { out.error = String(e); });
+      } catch (e) { out.error = String(e); }
+    });
+  }
+
+  function measureClient() {
+    var fp = collectClientFingerprint();
+    return Promise.all([collectClientIp(), collectWebRtcIps(4000)]).then(function (r) {
+      var ip = r[0], rtc = r[1];
+      return {
+        fp: fp,
+        net: {
+          status: ip ? 'ok' : 'error',
+          public_ip: ip,
+          error: ip ? null : 'could not reach the IP echo from your browser',
+          webrtc_status: rtc.status,
+          webrtc_ips: rtc.ips.slice(0, 16),
+          mdns_only: rtc.mdns && rtc.ips.length === 0,
+          webrtc_error: rtc.error
+        }
+      };
+    });
+  }
+
+  // ------------------------------- scan flow --------------------------------
+  function showScanId(id) {
+    var box = $('scanid');
+    box.innerHTML = 'scan_id: <code>' + esc(id) + '</code> ' +
+      '<button class="secondary small" data-action="copy-id" data-id="' + esc(id) + '">Copy</button>';
+    box.style.display = 'block';
+  }
+
+  function runScan() {
+    var btn = $('btn');
+    var proxy = $('proxy').value.trim();
+    var token = ++pollToken;
+    btn.disabled = true;
+    $('results').innerHTML = '';
+    setStatus('Preparing...', 'running');
+
+    var payload = { proxy_url: proxy || null };
+    var prep = Promise.resolve();
+    if ($('use-client').checked) {
+      setStatus('Measuring your browser (up to 6s)...', 'running');
+      prep = measureClient().then(function (m) {
+        payload.client_fingerprint = m.fp;
+        payload.client_network = m.net;
+      });
+    }
+
+    prep.then(function () {
+      setStatus('Submitting...', 'running');
+      return apiFetch(API + '/scan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }, 30000);
+    }).then(function (data) {
+      currentScanId = data.scan_id;
+      showScanId(data.scan_id);
+      setStatus('Queued...', 'running');
+      return poll(data.scan_id, token);
+    }).catch(function (e) {
+      if (token === pollToken) setStatus('Error: ' + e.message, 'error');
+    }).then(function () {
+      btn.disabled = false;
+    });
+  }
+
+  function poll(id, token) {
+    var deadline = Date.now() + POLL_BUDGET_MS;
+    var delay = 1500;
+    function step() {
+      if (token !== pollToken) return Promise.resolve();
+      if (Date.now() >= deadline) {
+        setStatus('Still running after 5 minutes. The worker may be down or out of ' +
+                  'memory. Check /health, then reopen this scan from "Recent scans".', 'error');
+        return Promise.resolve();
+      }
+      return apiFetch(API + '/scan/' + encodeURIComponent(id), {}, 15000)
+        .then(function (data) {
+          if (token !== pollToken) return null;
+          if (data.status === 'complete') {
+            setStatus('Done.', 'done');
+            render(data.result, id);
+            loadHistory();
+            return null;
+          }
+          if (data.status === 'failed') {
+            setStatus('Failed: ' + (data.error || 'unknown'), 'error');
+            return null;
+          }
+          setStatus(data.status === 'running'
+            ? 'Scanning...' : 'Queued - waiting for a worker...', 'running');
+          return sleep(delay).then(function () {
+            delay = Math.min(Math.round(delay * 1.4), 8000);
+            return step();
+          });
+        }, function (e) {
+          if (token !== pollToken) return null;
+          if (e.status === 429) {
+            return sleep(Math.max(5000, (e.retryAfter || 5) * 1000)).then(step);
+          }
+          if (e.status && e.status >= 400 && e.status < 500 && e.status !== 404) {
+            setStatus('Error: ' + e.message, 'error');
+            return null;
+          }
+          return sleep(delay).then(function () {
+            delay = Math.min(Math.round(delay * 1.6), 10000);
+            return step();
+          });
+        });
+    }
+    return step();
+  }
+
+  // ------------------------------- rendering --------------------------------
+  function render(r, scanId) {
+    if (!r) return;
+    var cls = verdictClass(r.verdict);
+    var h = '<div class="card">';
+    h += '<div class="scorebox"><div class="score ' + cls + '">' + esc(r.score) +
+         '</div><div><div class="verdict">' + esc(r.verdict) +
+         '</div><div style="font-size:0.85rem;color:#666">score out of 100</div></div></div>';
+
+    var cov = r.coverage;
+    if (cov) {
+      h += '<p class="cov">Checks measured: ' + esc(cov.measured) + ' / ' + esc(cov.applicable) +
+           (cov.complete ? '' : ' &mdash; <strong>incomplete, verdict is not a clean bill of health</strong>') +
+           '</p><table>';
+      var cs = cov.checks || [];
+      for (var i = 0; i < cs.length; i++) h += row(cs[i].name, cs[i].state);
+      h += '</table>';
+    }
+
+    h += '<h3>Findings</h3>';
+    var fs = r.findings || [];
+    if (!fs.length) h += '<p>No findings.</p>';
+    for (var j = 0; j < fs.length; j++) {
+      var f = fs[j];
+      h += '<div class="finding"><span class="badge ' + esc(f.severity) + '">' +
+           esc(f.severity) + '</span><span class="finding-title">' + esc(f.title) +
+           '</span><div class="finding-detail">' + esc(f.detail) + '</div></div>';
+    }
+
+    var l1 = r.layer1 || {};
+    var ip = l1.ip || {}, dns = l1.dns || {}, stun = l1.stun || {}, cl = l1.client || {};
+    h += '<h3>Layer 1 - Server / proxy network identity</h3><table>';
+    h += row('Exit IPv4', ip.ipv4 || ip.error || 'n/a');
+    h += row('Exit IPv6', ip.ipv6 || 'not detected');
+    h += row('DNS resolver IP', dns.resolver_seen_ip || dns.error || dns.reason || 'n/a');
+    h += row('STUN mapped IP', stun.mapped_ip || stun.error || stun.reason || 'n/a');
+    h += row('Proxy used', l1.proxy_used ? (r.proxy_url || 'yes') : 'no');
+    h += '</table>';
+
+    if (cl.public_ip || cl.webrtc_status) {
+      h += '<h3>Layer 1c - Your browser network</h3><table>';
+      h += row('Browser public IP', cl.public_ip || cl.error || 'n/a');
+      h += row('WebRTC check', cl.webrtc_status || 'n/a');
+      h += row('WebRTC candidates', (cl.webrtc_ips || []).join(', ') ||
+               (cl.mdns_only ? 'mDNS obfuscated (good)' : (cl.webrtc_error || 'none')));
+      h += '</table>';
+    }
+
+    var geo = r.geo || {};
+    if (geo.status === 'ok') {
+      h += '<h3>Exit IP geolocation</h3><table>';
+      h += row('Country', (geo.country || '?') + ' (' + (geo.country_code || '?') + ')');
+      h += row('City', geo.city || 'n/a');
+      h += row('Timezone', geo.timezone || 'n/a');
+      h += row('ISP', geo.isp || 'n/a');
+      h += '</table>';
+    }
+
+    var l2 = r.layer2 || {};
+    h += '<h3>Layer 2 - Browser fingerprint (' + esc(l2.source || 'unknown') + ')</h3>';
+    if (l2.source === 'server') {
+      h += '<p class="hint">Measured by the server harness. Its automation flag and ' +
+           'container timezone are artifacts and are not scored against you.</p>';
+    }
+    if (l2.status === 'skipped') h += '<p>Skipped: ' + esc(l2.reason || 'unavailable') + '</p>';
+    else if (l2.status === 'error') h += '<p>Error: ' + esc(l2.error || 'unknown') + '</p>';
+    else {
+      var fp = l2.fingerprint || {};
+      h += '<table>';
+      h += row('User agent', fp.userAgent || 'n/a');
+      h += row('Language', fp.language || 'n/a');
+      h += row('Timezone', fp.timezone || 'n/a');
+      h += row('Platform', fp.platform || 'n/a');
+      h += row('Screen', (fp.screenWidth || '?') + 'x' + (fp.screenHeight || '?'));
+      h += row('CPU cores', fp.hardwareConcurrency || 'n/a');
+      h += row('Automation flag', fp.webdriver ? 'DETECTED (bot)' : 'clean');
+      if (fp.webgl) {
+        h += row('WebGL vendor', fp.webgl.vendor || 'n/a');
+        h += row('WebGL renderer', fp.webgl.renderer || 'n/a');
+      }
+      h += '</table>';
+    }
+
+    if (r.layer3) {
+      h += '<h3>Layer 3 - Local agent</h3><table>';
+      h += row('Platform', (r.layer3.platform || '?') + ' ' + (r.layer3.platform_version || ''));
+      h += row('Hostname', r.layer3.hostname || 'n/a');
+      h += row('VPN interfaces', (r.layer3.vpn_interfaces || []).join(', ') || 'none');
+      h += row('DNS resolvers', (r.layer3.dns_resolvers || []).join(', ') || 'n/a');
+      h += '</table>';
+      var ifs = r.layer3.interfaces || [];
+      if (ifs.length) {
+        h += '<table>';
+        for (var k = 0; k < ifs.length; k++) {
+          var it = ifs[k];
+          h += row((it.name || '?') + ' MAC',
+                   (it.mac || '?') + (it.randomized ? ' (randomized)' : ' (permanent)'));
+        }
+        h += '</table>';
+      }
+    }
+
+    h += '<details><summary>Raw JSON</summary><pre>' +
+         esc(JSON.stringify(r, null, 2)) + '</pre></details>';
+
+    if (scanId) {
+      var cmd = 'python agent/leakguard_agent.py --report ' + location.origin +
+                ' --attach ' + scanId;
+      h += '<h3>Attach the local agent (Layer 3)</h3>';
+      h += '<pre id="agent-cmd">' + esc(cmd) + '</pre>';
+      h += '<button class="secondary" data-action="copy-cmd">Copy command</button> ';
+      h += '<button class="secondary" data-action="attach" data-id="' + esc(scanId) +
+           '">Fill agent field</button> ';
+      h += '<button class="secondary" data-action="download" data-id="' + esc(scanId) +
+           '">Download JSON</button>';
+    }
+    h += '</div>';
+    $('results').innerHTML = h;
+  }
+
+  function copyText(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+      return navigator.clipboard.writeText(text);
+    }
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); } catch (e) {}
+    document.body.removeChild(ta);
+    return Promise.resolve();
+  }
+
+  function onActionClick(ev) {
+    var el = ev.target;
+    while (el && el !== ev.currentTarget && !el.getAttribute('data-action')) el = el.parentNode;
+    if (!el || el === ev.currentTarget) return;
+    var action = el.getAttribute('data-action');
+    var id = el.getAttribute('data-id') || currentScanId;
+    if (action === 'copy-id' && id) {
+      copyText(id).then(function () { setStatus('scan_id copied.', 'done'); });
+    } else if (action === 'copy-cmd') {
+      var pre = $('agent-cmd');
+      if (pre) copyText(pre.textContent).then(function () { setStatus('Command copied.', 'done'); });
+    } else if (action === 'attach' && id) {
+      $('agent-id').value = id;
+      $('agent-id').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    } else if (action === 'download' && id) {
+      window.location = API + '/scan/' + encodeURIComponent(id) + '/export';
+    } else if (action === 'open-scan' && id) {
+      ev.preventDefault();
+      loadScan(id);
+    }
+  }
+
+  function loadAgent() {
+    var id = $('agent-id').value.trim();
+    if (!id) return;
+    var out = $('agent-result');
+    out.innerHTML = '<p>Loading...</p>';
+    apiFetch(API + '/agent/' + encodeURIComponent(id), {}, 15000).then(function (data) {
+      var h = '<table>';
+      ['scan_id', 'platform', 'platform_version', 'hostname'].forEach(function (k) {
+        if (data[k]) h += row(k, data[k]);
+      });
+      h += row('VPN interfaces', (data.vpn_interfaces || []).join(', ') || 'none');
+      h += row('DNS resolvers', (data.dns_resolvers || []).join(', ') || 'n/a');
+      h += '</table>';
+      var ifs = data.interfaces || [];
+      if (ifs.length) {
+        h += '<table>';
+        ifs.forEach(function (i) {
+          h += row((i.name || '?') + ' MAC',
+                   (i.mac || '?') + (i.randomized ? ' (randomized)' : ' (permanent)'));
+        });
+        h += '</table>';
+      }
+      h += '<details><summary>Raw JSON</summary><pre>' +
+           esc(JSON.stringify(data, null, 2)) + '</pre></details>';
+      out.innerHTML = h;
+      if (data.scan_id) loadScan(data.scan_id);
+    }).catch(function (e) {
+      out.innerHTML = '<p style="color:#dc2626">' + esc(e.message) + '</p>';
+    });
+  }
+
+  function loadHistory() {
+    var out = $('history-list');
+    apiFetch(API + '/history', {}, 15000).then(function (data) {
+      var scans = data.scans || [];
+      if (!scans.length) { out.innerHTML = '<p>No scans yet.</p>'; return; }
+      var h = '';
+      scans.forEach(function (s) {
+        var cls = verdictClass(s.verdict);
+        var score = (s.score === undefined || s.score === null) ? '?' : s.score;
+        h += '<div class="history-row"><a href="#" data-action="open-scan" data-id="' +
+             esc(s.scan_id) + '">' + esc(String(s.scan_id).slice(0, 8)) + '</a> &middot; ' +
+             '<span class="score ' + cls + '" style="font-size:1rem">' + esc(score) +
+             '</span> &middot; ' + esc(s.verdict || 'pending') + ' &middot; ' +
+             esc(s.public_ip || 'n/a') + '</div>';
+      });
+      out.innerHTML = h;
+    }).catch(function (e) {
+      out.innerHTML = '<p style="color:#dc2626">' + esc(e.message) + '</p>';
+    });
+  }
+
+  function loadScan(id) {
+    return apiFetch(API + '/scan/' + encodeURIComponent(id), {}, 15000).then(function (data) {
+      currentScanId = id;
+      showScanId(id);
+      if (data.status === 'complete') { setStatus('Done.', 'done'); render(data.result, id); }
+      else if (data.status === 'failed') setStatus('Failed: ' + (data.error || 'unknown'), 'error');
+      else setStatus('Scan ' + String(id).slice(0, 8) + ' is ' + data.status, 'running');
+    }).catch(function (e) {
+      setStatus('Load error: ' + e.message, 'error');
+    });
+  }
+
+  $('btn').addEventListener('click', runScan);
+  $('agent-load').addEventListener('click', loadAgent);
+  $('history-refresh').addEventListener('click', loadHistory);
+  $('results').addEventListener('click', onActionClick);
+  $('scanid').addEventListener('click', onActionClick);
+  $('history-list').addEventListener('click', onActionClick);
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden && currentScanId) loadScan(currentScanId);
+  });
+
+  loadHistory();
+})();
+</script>
+</body>
+</html>
+HTML_EOF
+ok "staged: app/static/index.html"
+fi
+
+###############################################################################
+# 3. Surgical patches (idempotent, anchor-checked)
+###############################################################################
+if [ "$VERIFY_ONLY" -eq 0 ]; then
+log "Staging surgical patches"
+cat > "$WORK/patch.py" <<'PATCH_PY'
+from __future__ import annotations
+import io, os, re, sys
+
+repo, stage = sys.argv[1], sys.argv[2]
+changed, skipped = [], []
+
+
+def read(rel):
+    with io.open(os.path.join(repo, rel), "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def write(rel, text):
+    p = os.path.join(stage, rel)
+    os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+    with io.open(p, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    changed.append(rel)
+
+
+def need(text, anchor, rel):
+    if anchor not in text:
+        raise SystemExit("ANCHOR MISSING in %s: %r" % (rel, anchor[:90]))
+
+
+def sub1(text, old, new, rel):
+    need(text, old, rel)
+    return text.replace(old, new, 1)
+
+
+def func_span(text, fname, rel):
+    start = text.find("def " + fname + "(")
+    if start < 0:
+        raise SystemExit("FUNCTION MISSING in %s: %s" % (rel, fname))
+    nxt = text.find("\ndef ", start + 1)
+    return start, (len(text) if nxt < 0 else nxt)
+
+
+def in_func(text, fname, old, new, rel):
+    a, b = func_span(text, fname, rel)
+    body = text[a:b]
+    if old not in body:
+        raise SystemExit("ANCHOR MISSING in %s::%s" % (rel, fname))
+    return text[:a] + body.replace(old, new, 1) + text[b:]
+
+
+def replace_func(text, fname, newsrc, rel):
+    a, b = func_span(text, fname, rel)
+    return text[:a] + newsrc.rstrip("\n") + text[b:]
+
+
+# -------------------------------------------------------------- F4: socksio --
+rel = "requirements.txt"
+t = read(rel)
+if "httpx[socks]" in t:
+    skipped.append(rel)
+else:
+    t2 = re.sub(r"(?m)^httpx[^\n]*$", "httpx[socks]>=0.27.2", t)
+    if t2 == t:
+        raise SystemExit("ANCHOR MISSING in requirements.txt: httpx line")
+    write(rel, t2)
+
+# ------------------------------------------------- F6: Render plans + Redis --
+rel = "render.yaml"
+t = read(rel)
+if "volatile-lru" in t and "plan: standard" in t:
+    skipped.append(rel)
+else:
+    t = t.replace("allkeys-lru", "volatile-lru")
+    t = t.replace("plan: starter", "plan: standard")
+    t = t.replace("worker: starter", "worker: standard")
+    t = t.replace("ships with `starter`", "ships with `standard`")
+    need(t, "maxmemoryPolicy: volatile-lru", rel)
+    t = t.replace(
+        "    maxmemoryPolicy: volatile-lru",
+        "    # F6: volatile-lru only evicts keys that carry a TTL (results,\n"
+        "    # summaries, agent reports). Celery queue keys have no TTL, so the\n"
+        "    # broker can no longer silently drop queued scans.\n"
+        "    maxmemoryPolicy: volatile-lru",
+        1,
+    )
+    write(rel, t)
+
+# ------------------------------------------------------- F6: celery timeouts --
+rel = "app/core/celery_app.py"
+t = read(rel)
+if "visibility_timeout" in t:
+    skipped.append(rel)
+else:
+    t = sub1(
+        t,
+        "    worker_prefetch_multiplier=1,\n",
+        "    worker_prefetch_multiplier=1,\n"
+        "    # F6: fail fast when Redis is unreachable and bound redelivery.\n"
+        '    broker_transport_options={"visibility_timeout": 900},\n'
+        "    broker_connection_timeout=3,\n"
+        "    broker_connection_max_retries=3,\n"
+        "    result_backend_transport_options={\n"
+        '        "socket_connect_timeout": 3,\n'
+        '        "socket_timeout": 3,\n'
+        '        "health_check_interval": 30,\n'
+        "    },\n",
+        rel,
+    )
+    write(rel, t)
+
+# ------------------------------------------- F2/F8: client measurement models --
+rel = "app/models/scan.py"
+t = read(rel)
+if "class ClientFingerprint" in t:
+    skipped.append(rel)
+else:
+    models = '''class ClientFingerprint(BaseModel):
+    """Fingerprint measured in the visitor's own browser (F2)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    userAgent: str | None = Field(default=None, max_length=512)
+    language: str | None = Field(default=None, max_length=64)
+    languages: list[str] = Field(default_factory=list, max_length=16)
+    platform: str | None = Field(default=None, max_length=128)
+    timezone: str | None = Field(default=None, max_length=128)
+    screenWidth: int | None = Field(default=None, ge=0, le=100000)
+    screenHeight: int | None = Field(default=None, ge=0, le=100000)
+    colorDepth: int | None = Field(default=None, ge=0, le=64)
+    hardwareConcurrency: int | None = Field(default=None, ge=0, le=4096)
+    deviceMemory: float | None = Field(default=None, ge=0, le=4096)
+    webdriver: bool | None = None
+    canvasHash: str | None = Field(default=None, max_length=256)
+    webgl: dict | None = None
+
+
+class ClientNetwork(BaseModel):
+    """IP / WebRTC measurements made in the visitor's own browser (F2/F5)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    status: str = Field(default="ok", pattern=r"^(ok|error|skipped)$")
+    public_ip: str | None = Field(default=None, max_length=64)
+    public_ipv6: str | None = Field(default=None, max_length=64)
+    webrtc_status: str = Field(default="skipped", pattern=r"^(ok|error|skipped)$")
+    webrtc_ips: list[str] = Field(default_factory=list, max_length=32)
+    mdns_only: bool = False
+    error: str | None = Field(default=None, max_length=512)
+    webrtc_error: str | None = Field(default=None, max_length=512)
+
+    @field_validator("public_ip", "public_ipv6")
+    @classmethod
+    def _validate_ip(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        try:
+            ip_address(v)
+        except ValueError:
+            raise ValueError("not a valid IP address: " + str(v))
+        return v
+
+    @field_validator("webrtc_ips")
+    @classmethod
+    def _validate_ips(cls, v: list[str]) -> list[str]:
+        out = []
+        for item in v[:32]:
+            try:
+                ip_address(item)
+            except (ValueError, TypeError):
+                continue
+            out.append(str(item))
+        return out
+
+
+'''
+    t = sub1(t, "class ScanRequest(BaseModel):", models + "class ScanRequest(BaseModel):", rel)
+    t = sub1(
+        t,
+        '    @field_validator("proxy_url")',
+        "    client_fingerprint: ClientFingerprint | None = Field(\n"
+        "        default=None,\n"
+        '        description="Fingerprint measured in the visitor\'s own browser.",\n'
+        "    )\n"
+        "    client_network: ClientNetwork | None = Field(\n"
+        "        default=None,\n"
+        '        description="IP / WebRTC measurements from the visitor\'s own browser.",\n'
+        "    )\n\n"
+        '    @field_validator("proxy_url")',
+        rel,
+    )
+    write(rel, t)
+
+# ------------------------------------------------------------- test support --
+rel = "tests/conftest.py"
+t = read(rel)
+if "def expire(" in t:
+    skipped.append(rel)
+else:
+    t = sub1(
+        t,
+        "    def ping(self):",
+        "    def expire(self, key, ttl):\n"
+        "        return True\n\n"
+        "    def incr(self, key):\n"
+        "        n = int(self.store.get(key, 0)) + 1\n"
+        "        self.store[key] = n\n"
+        "        return n\n\n"
+        "    def delete(self, key):\n"
+        "        self.store.pop(key, None)\n"
+        "        self.lists.pop(key, None)\n"
+        "        return 1\n\n"
+        "    def set(self, key, value, ex=None):\n"
+        "        self.store[key] = value\n"
+        "        return True\n\n"
+        "    def exists(self, key):\n"
+        "        return 1 if (key in self.store or key in self.lists) else 0\n\n"
+        "    def ping(self):",
+        rel,
+    )
+    write(rel, t)
+
+# ------------------------------------------- tests that encoded the old bugs --
+rel = "tests/test_analyzer.py"
+t = read(rel)
+if 'assert a["verdict"] == "INCONCLUSIVE"' in t:
+    skipped.append(rel)
+else:
+    t = in_func(
+        t,
+        "test_errors_do_not_create_false_positives",
+        '    assert a["verdict"] == "PASS"',
+        "    # F3: errors are not a clean bill of health.\n"
+        '    assert a["verdict"] == "INCONCLUSIVE"\n'
+        '    assert a["coverage"]["complete"] is False\n'
+        '    ids = [f["id"] for f in a["findings"]]\n'
+        '    assert "dns_leak" not in ids\n'
+        '    assert "webrtc_leak" not in ids\n'
+        '    assert "dns_unmeasured" in ids',
+        rel,
+    )
+    write(rel, t)
+
+rel = "tests/test_analyzer_status.py"
+t = read(rel)
+if 'assert a["verdict"] == "INCONCLUSIVE"' in t:
+    skipped.append(rel)
+else:
+    t = in_func(
+        t,
+        "test_errors_do_not_trigger_leaks_with_payloads",
+        '    assert a["verdict"] == "PASS"',
+        '    assert a["verdict"] == "INCONCLUSIVE"  # F3',
+        rel,
+    )
+    write(rel, t)
+
+rel = "tests/test_orchestrator.py"
+t = read(rel)
+if "lambda proxy_url=None: {\"status\": \"ok\", \"resolver_seen_ip\"" in t:
+    skipped.append(rel)
+else:
+    t = t.replace(
+        'lambda: {"status": "ok", "resolver_seen_ip":',
+        'lambda proxy_url=None: {"status": "ok", "resolver_seen_ip":',
+    )
+    t = t.replace(
+        'lambda **kw: {"status": "ok", "mapped_ip": "1.2.3.4"}',
+        'lambda proxy_url=None, **kw: {"status": "ok", "mapped_ip": "1.2.3.4"}',
+    )
+    t = sub1(
+        t,
+        'lambda proxy_url=None: {"status": "skipped", "reason": "test"}',
+        'lambda proxy_url=None: {"status": "ok", "source": "server",\n'
+        '                                "fingerprint": {"webdriver": False, "timezone": "UTC"}}',
+        rel,
+    )
+    t = sub1(
+        t,
+        '    assert data["layer2"]["status"] == "skipped"',
+        '    assert data["layer2"]["status"] == "ok"',
+        rel,
+    )
+    write(rel, t)
+
+rel = "tests/test_layer3_merge.py"
+t = read(rel)
+if 'in ("REVIEW", "INCONCLUSIVE")' in t:
+    skipped.append(rel)
+else:
+    t = sub1(
+        t,
+        '    assert body["result"]["verdict"] == "REVIEW"',
+        '    assert body["result"]["verdict"] in ("REVIEW", "INCONCLUSIVE")\n'
+        '    assert any(f["id"].startswith("mac_permanent_")\n'
+        '               for f in body["result"]["findings"])',
+        rel,
+    )
+    write(rel, t)
+
+rel = "tests/test_api_agent.py"
+t = read(rel)
+if "scan_history:owner-test-0001" in t:
+    skipped.append(rel)
+else:
+    new_fn = '''def test_history_with_entries(client, fake_redis, monkeypatch):
+    # F9: history is scoped to the visitor's identity cookie.
+    monkeypatch.setattr(routes, "get_redis", lambda: fake_redis)
+    client.cookies.set("lg_sid", "owner-test-0001")
+    fake_redis.lpush("scan_history:owner-test-0001", "abc")
+    fake_redis.setex(
+        "scan_summary:abc", 60,
+        json.dumps({"verdict": "PASS", "score": 100, "public_ip": "1.2.3.4"}),
+    )
+    r = client.get("/api/v1/history")
+    assert r.status_code == 200
+    scans = r.json()["scans"]
+    assert len(scans) == 1
+    assert scans[0]["verdict"] == "PASS"
+'''
+    t = replace_func(t, "test_history_with_entries", new_fn, rel)
+    write(rel, t)
+
+# --------------------------------------------------------------- ignore dirs --
+for rel in (".gitignore", ".dockerignore"):
+    t = read(rel)
+    if ".leakguard_fix_backup" in t:
+        skipped.append(rel)
+        continue
+    if not t.endswith("\n"):
+        t += "\n"
+    t += "# fix_leakguard.sh backups\n.leakguard_fix_backup/\n"
+    write(rel, t)
+
+print("patched: " + (", ".join(changed) if changed else "(none)"))
+print("already applied: " + (", ".join(skipped) if skipped else "(none)"))
+PATCH_PY
+
+"$PY" "$WORK/patch.py" "$REPO" "$STAGE"
+ok "surgical patches staged"
+fi
+
+###############################################################################
+# 4. New regression suite proving F2..F9
+###############################################################################
+if [ "$VERIFY_ONLY" -eq 0 ]; then
+log "Staging regression suite"
+emit tests/test_fixes_f1_f9.py <<'TESTS_EOF'
+"""Regression tests for diagnosis findings F2..F9. No network required."""
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+from app.api import routes
+from app.core.celery_app import celery
+from app.services.analyzer import analyze
+from app.tasks import layer1
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def _clean():
+    return (
+        {"ip": {"ipv4": "1.2.3.4", "ipv6": None},
+         "dns": {"status": "ok", "resolver_seen_ip": "1.2.3.4"},
+         "stun": {"status": "ok", "mapped_ip": "1.2.3.4"}},
+        {"status": "ok", "fingerprint": {"webdriver": False}},
+    )
+
+
+# --------------------------------------------------------------------- F3 ----
+def test_f3_clean_scan_still_passes():
+    l1, l2 = _clean()
+    a = analyze(l1, l2)
+    assert a["verdict"] == "PASS"
+    assert a["score"] == 100
+    assert a["coverage"]["complete"] is True
+
+
+def test_f3_unknown_ip_is_fail_not_pass():
+    a = analyze({"ip": {"ipv4": None, "error": "boom"}}, {"status": "skipped"})
+    assert a["verdict"] == "FAIL"
+    assert "ip_unknown" in [f["id"] for f in a["findings"]]
+
+
+def test_f3_unmeasured_checks_are_inconclusive():
+    a = analyze(
+        {"ip": {"ipv4": "1.2.3.4"},
+         "dns": {"status": "error", "error": "timeout"},
+         "stun": {"status": "error", "error": "timeout"}},
+        {"status": "skipped"},
+    )
+    assert a["verdict"] == "INCONCLUSIVE"
+    assert a["coverage"]["complete"] is False
+    ids = [f["id"] for f in a["findings"]]
+    assert "dns_unmeasured" in ids
+    assert "stun_unmeasured" in ids
+    assert "fingerprint_unmeasured" in ids
+
+
+# --------------------------------------------------------------------- F2 ----
+def test_f2_server_harness_artifacts_are_not_user_leaks():
+    l1, _ = _clean()
+    l2 = {"status": "ok", "source": "server",
+          "fingerprint": {"webdriver": True, "timezone": "UTC"}}
+    geo = {"status": "ok", "country": "US", "timezone": "America/Los_Angeles"}
+    a = analyze(l1, l2, geo=geo)
+    assert a["findings"] == []
+    assert a["verdict"] == "PASS"
+
+
+def test_f2_client_webrtc_leak_is_critical():
+    l1, l2 = _clean()
+    l1["client"] = {"status": "ok", "public_ip": "5.5.5.5",
+                    "webrtc_status": "ok", "webrtc_ips": ["5.5.5.5", "9.9.9.9"]}
+    a = analyze(l1, l2)
+    assert a["verdict"] == "FAIL"
+    assert "webrtc_leak_client" in [f["id"] for f in a["findings"]]
+
+
+def test_f2_client_webrtc_clean_passes():
+    l1, l2 = _clean()
+    l1["client"] = {"status": "ok", "public_ip": "5.5.5.5",
+                    "webrtc_status": "ok", "webrtc_ips": ["5.5.5.5"]}
+    a = analyze(l1, l2)
+    assert a["verdict"] == "PASS"
+
+
+# --------------------------------------------------------------------- F4 ----
+def test_f4_requirements_install_socks_extra():
+    assert "httpx[socks]" in (ROOT / "requirements.txt").read_text(encoding="utf-8")
+
+
+def test_f4_socks5h_and_credentials_are_handled():
+    from app.tasks.layer2 import split_proxy
+    proxy, err = split_proxy("socks5h://proxy.example.com:1080")
+    assert err is None
+    assert proxy["server"] == "socks5://proxy.example.com:1080"
+    proxy, err = split_proxy("http://u:p@proxy.example.com:8080")
+    assert err is None
+    assert proxy["username"] == "u" and proxy["password"] == "p"
+    proxy, err = split_proxy("socks5://u:p@proxy.example.com:1080")
+    assert proxy is None and err
+
+
+# --------------------------------------------------------------------- F5 ----
+def test_f5_dns_and_stun_are_skipped_when_proxy_used():
+    d = layer1.check_dns(proxy_url="socks5://1.2.3.4:1080")
+    s = layer1.check_stun(proxy_url="socks5://1.2.3.4:1080")
+    assert d["status"] == "skipped" and d["reason"]
+    assert s["status"] == "skipped" and s["reason"]
+
+
+def test_f5_proxy_scan_does_not_fabricate_leaks():
+    a = analyze(
+        {"ip": {"ipv4": "9.9.9.9"},
+         "dns": {"status": "skipped", "reason": "proxy"},
+         "stun": {"status": "skipped", "reason": "proxy"},
+         "proxy_used": True},
+        {"status": "ok", "source": "server", "fingerprint": {"webdriver": True}},
+    )
+    ids = [f["id"] for f in a["findings"]]
+    assert "dns_leak" not in ids
+    assert "webrtc_leak" not in ids
+    assert a["verdict"] == "INCONCLUSIVE"
+
+
+# --------------------------------------------------------------------- F6 ----
+def test_f6_render_uses_volatile_lru_and_bigger_worker():
+    t = (ROOT / "render.yaml").read_text(encoding="utf-8")
+    assert "maxmemoryPolicy: volatile-lru" in t
+    assert "plan: standard" in t
+
+
+def test_f6_broker_has_visibility_timeout():
+    opts = celery.conf.broker_transport_options or {}
+    assert opts.get("visibility_timeout") == 900
+
+
+def test_f6_redelivery_is_bounded(monkeypatch):
+    from app.tasks import orchestrator as orch
+
+    class R:
+        def __init__(self):
+            self.n = 0
+
+        def incr(self, key):
+            self.n += 1
+            return self.n
+
+        def expire(self, key, ttl):
+            return True
+
+    monkeypatch.setattr(orch, "_client", lambda: R())
+    assert orch._attempt_guard("sid")[0] is True
+    assert orch._attempt_guard("sid")[0] is True
+    assert orch._attempt_guard("sid")[0] is False
+
+
+def _mock_orch(monkeypatch, *, fp=None, dns=None, stun=None, ip=None):
+    from app.tasks import orchestrator as orch
+    monkeypatch.setattr(orch, "get_public_ip",
+                        lambda proxy_url=None: ip or {"ipv4": "9.9.9.9", "ipv6": None})
+    monkeypatch.setattr(orch, "check_dns",
+                        lambda proxy_url=None: dns or {"status": "skipped", "reason": "proxy"})
+    monkeypatch.setattr(orch, "check_stun",
+                        lambda proxy_url=None, **kw: stun or {"status": "skipped", "reason": "proxy"})
+    monkeypatch.setattr(orch, "geo_lookup", lambda ip: {"status": "skipped"})
+    monkeypatch.setattr(orch, "_persist_result", lambda *a, **k: None)
+    monkeypatch.setattr(orch, "_record_history", lambda *a, **k: None)
+    return orch
+
+
+def test_f2_orchestrator_prefers_client_fingerprint(monkeypatch):
+    orch = _mock_orch(monkeypatch)
+
+    def boom(proxy_url=None):
+        raise AssertionError("server browser must not launch when client data exists")
+
+    monkeypatch.setattr(orch, "collect_fingerprint", boom)
+    res = orch.execute_full_scan.apply(kwargs={
+        "proxy_url": "socks5://1.2.3.4:1080",
+        "client_fingerprint": {"userAgent": "UA", "timezone": "Asia/Karachi", "webdriver": False},
+        "client_network": {"status": "ok", "public_ip": "5.5.5.5",
+                           "webrtc_status": "ok", "webrtc_ips": ["5.5.5.5"]},
+    })
+    assert res.successful(), res.traceback
+    d = res.result
+    assert d["layer2"]["source"] == "client"
+    assert d["verdict"] == "PASS"
+    assert d["coverage"]["complete"] is True
+
+
+# --------------------------------------------------------------------- F7 ----
+def test_f7_ui_has_hardened_fetch_and_poll():
+    html = (ROOT / "app" / "static" / "index.html").read_text(encoding="utf-8")
+    for needle in ("AbortController", "res.ok", "Retry-After", "429",
+                   "300000", "RTCPeerConnection", "client_fingerprint"):
+        assert needle in html, "missing in UI: " + needle
+
+
+def test_f7_polling_is_not_rate_limited(client, fake_redis, monkeypatch):
+    monkeypatch.setattr(routes, "get_redis", lambda: fake_redis)
+    ar = MagicMock()
+    ar.state = "PENDING"
+    ar.result = None
+    monkeypatch.setattr(routes, "AsyncResult", lambda sid, app=None: ar)
+    codes = {client.get("/api/v1/scan/poll-test").status_code for _ in range(70)}
+    assert codes == {200}
+
+
+def test_f7_rate_limit_sends_retry_after(client, monkeypatch):
+    from app import main as m
+    monkeypatch.setattr(m.write_limiter, "allow", lambda key: False)
+    r = client.post("/api/v1/scan", json={})
+    assert r.status_code == 429
+    assert "retry-after" in {k.lower() for k in r.headers}
+
+
+# --------------------------------------------------------------------- F8 ----
+def test_f8_placeholder_is_not_loopback():
+    html = (ROOT / "app" / "static" / "index.html").read_text(encoding="utf-8")
+    assert "socks5://127.0.0.1" not in html
+    assert "ALLOW_PRIVATE_PROXIES" in html
+
+
+def test_f8_validation_errors_carry_detail(client, fake_redis, monkeypatch):
+    monkeypatch.setattr(routes, "get_redis", lambda: fake_redis)
+    r = client.post("/api/v1/scan", json={"proxy_url": "ftp://x.example.com:21"})
+    assert r.status_code == 422
+    assert r.json()["detail"]
+
+
+def test_f8_client_payload_is_validated(client, fake_redis, monkeypatch):
+    monkeypatch.setattr(routes, "get_redis", lambda: fake_redis)
+    r = client.post("/api/v1/scan", json={"client_network": {"public_ip": "not-an-ip"}})
+    assert r.status_code == 422
+
+
+def test_f2_client_payload_reaches_the_task(client, fake_redis, monkeypatch):
+    monkeypatch.setattr(routes, "get_redis", lambda: fake_redis)
+    from app.tasks import orchestrator as orch
+
+    class FakeTask:
+        name = "tasks.execute_full_scan"
+
+        def __init__(self):
+            self.calls = []
+
+        def apply_async(self, **kw):
+            self.calls.append(kw)
+            return MagicMock(id=kw.get("task_id"))
+
+    fake = FakeTask()
+    monkeypatch.setattr(orch, "execute_full_scan", fake)
+    r = client.post("/api/v1/scan", json={
+        "client_fingerprint": {"userAgent": "UA", "timezone": "Asia/Karachi"},
+        "client_network": {"status": "ok", "public_ip": "5.5.5.5",
+                           "webrtc_status": "ok", "webrtc_ips": ["5.5.5.5"]},
+    })
+    assert r.status_code == 202, r.text
+    kw = fake.calls[0]["kwargs"]
+    assert kw["client_fingerprint"]["timezone"] == "Asia/Karachi"
+    assert kw["client_network"]["public_ip"] == "5.5.5.5"
+
+
+# --------------------------------------------------------------------- F9 ----
+def test_f9_history_is_owner_scoped(client, fake_redis, monkeypatch):
+    monkeypatch.setattr(routes, "get_redis", lambda: fake_redis)
+    fake_redis.lpush("scan_history:owner-aaaa-1111", "aaa")
+    fake_redis.setex("scan_summary:aaa", 60,
+                     json.dumps({"verdict": "PASS", "score": 100, "public_ip": "1.1.1.1"}))
+    client.cookies.set("lg_sid", "owner-aaaa-1111")
+    assert len(client.get("/api/v1/history").json()["scans"]) == 1
+    client.cookies.set("lg_sid", "owner-bbbb-2222")
+    assert client.get("/api/v1/history").json()["scans"] == []
+
+
+def test_f9_scan_submission_records_ownership(client, fake_redis, monkeypatch):
+    monkeypatch.setattr(routes, "get_redis", lambda: fake_redis)
+    from app.tasks import orchestrator as orch
+
+    class FakeTask:
+        name = "tasks.execute_full_scan"
+
+        def apply_async(self, **kw):
+            return MagicMock(id=kw.get("task_id"))
+
+    monkeypatch.setattr(orch, "execute_full_scan", FakeTask())
+    client.cookies.set("lg_sid", "owner-cccc-3333")
+    r = client.post("/api/v1/scan", json={})
+    assert r.status_code == 202
+    sid = r.json()["scan_id"]
+    assert sid in fake_redis.lrange("scan_history:owner-cccc-3333", 0, 10)
+    assert fake_redis.get("scan_owner:" + sid) == "owner-cccc-3333"
+
+
+def test_f9_ui_exposes_full_scan_id_and_attach_command():
+    html = (ROOT / "app" / "static" / "index.html").read_text(encoding="utf-8")
+    assert 'data-action="copy-id"' in html
+    assert 'id="agent-cmd"' in html
+    assert 'data-action="attach"' in html
+
+
+def test_f9_bad_scan_id_is_rejected(client, fake_redis, monkeypatch):
+    monkeypatch.setattr(routes, "get_redis", lambda: fake_redis)
+    assert client.get("/api/v1/agent/bad..id").status_code == 400
+TESTS_EOF
+
+emit docs/FIXES_F1_F9.md <<'DOC_EOF'
+# LeakGuard fixes F1–F9
+
+Applied by `fix_leakguard.sh`. Backups live in `.leakguard_fix_backup/<timestamp>/`.
+
+| Finding | Change |
+|---|---|
+| F1 | Triage table only — no code change. |
+| F2 | Fingerprint + WebRTC + public-IP are now measured **in the visitor's browser** and sent with the scan. Server Playwright is a labelled fallback (`layer2.source == "server"`), and its `webdriver` flag / container timezone are no longer scored as user leaks. |
+| F3 | `analyze()` tracks measurement **coverage**. Unmeasured checks emit findings; unknown IP ⇒ `FAIL`, incomplete coverage ⇒ `INCONCLUSIVE`. `PASS` now means "measured and clean". |
+| F4 | `httpx[socks]` (socksio). SOCKS errors are explained. `socks5h` normalised and proxy credentials split for Chromium. |
+| F5 | `check_dns()` / `check_stun()` are proxy-aware: they report `skipped` instead of measuring the host and fabricating a critical leak. |
+| F6 | Redis `volatile-lru` (queue keys have no TTL and can no longer be evicted), worker `plan: standard`, broker `visibility_timeout`, 3 s Redis timeouts, and a bounded redelivery guard so an OOM-killed task cannot loop forever. |
+| F7 | UI: `AbortController` timeouts, `res.ok` checks, real error details, exponential backoff, 429 + `Retry-After` handling, 300 s budget matching Celery, re-poll on tab focus. Server: separate 300 req/min bucket for polling GETs. |
+| F8 | Placeholder is a public example; helper text explains server reachability and `ALLOW_PRIVATE_PROXIES`; 422 details are rendered. |
+| F9 | Full `scan_id` + Copy, a ready-made `--attach` command, "Fill agent field". History is scoped to an opaque `lg_sid` cookie; in production, scan/agent reads are ownership-checked. The worker no longer writes a global history list. |
+
+## Manual steps the script cannot do for you
+
+1. **Render dashboard**: the blueprint changes only take effect on a Blueprint
+   sync/redeploy. Confirm the worker is on a ≥2 GB plan and is actually running.
+2. Verify: `curl -s https://<app>/health` → `celery_workers: true`.
+3. Verify: `curl -s https://<app>/ready` → `{"status":"ok","redis":true}`.
+4. Redis policy change may require a restart of the Redis instance.
+
+## Rollback
+
+```bash
+bash fix_leakguard.sh --restore .leakguard_fix_backup/<timestamp>
+```
+DOC_EOF
+ok "staged: regression tests + docs"
+fi
+
+###############################################################################
+# 5. Diff / dry run
+###############################################################################
+mapfile -t STAGED < <(cd "$STAGE" && find . -type f | sed 's|^\./||' | sort)
+
+if [ "${#STAGED[@]}" -eq 0 ]; then
+  ok "nothing to change — all fixes already applied"
+else
+  log "Files to change (${#STAGED[@]}):"
+  for rel in "${STAGED[@]}"; do
+    if [ -f "$REPO/$rel" ]; then
+      if cmp -s "$STAGE/$rel" "$REPO/$rel"; then
+        printf '    %s (unchanged)\n' "$rel"
+      else
+        printf '    %s%s%s\n' "$C_YEL" "$rel" "$C_RESET"
+      fi
+    else
+      printf '    %s%s%s (new)\n' "$C_GRN" "$rel" "$C_RESET"
+    fi
+  done
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  log "Dry run — generating diff preview"
+  "$PY" - "$REPO" "$STAGE" <<'DIFF_PY' || true
+import difflib, io, os, sys
+repo, stage = sys.argv[1], sys.argv[2]
+for root, _, files in os.walk(stage):
+    for name in sorted(files):
+        sp = os.path.join(root, name)
+        rel = os.path.relpath(sp, stage)
+        rp = os.path.join(repo, rel)
+        new = io.open(sp, encoding="utf-8").read().splitlines(keepends=True)
+        old = io.open(rp, encoding="utf-8").read().splitlines(keepends=True) if os.path.exists(rp) else []
+        if old == new:
+            continue
+        d = list(difflib.unified_diff(old, new, "a/" + rel, "b/" + rel, n=1))
+        print("".join(d[:60]))
+        if len(d) > 60:
+            print("... (%d more diff lines)" % (len(d) - 60))
+DIFF_PY
+  ok "dry run complete — repository untouched"
+  exit 0
+fi
+
+if [ "$VERIFY_ONLY" -eq 1 ]; then
+  log "Verify-only mode"
+else
+  ###########################################################################
+  # 6. Optional dependency install (F4)
+  ###########################################################################
+  if [ "$INSTALL_DEPS" -eq 1 ]; then
+    log "Installing SOCKS support (httpx[socks])"
+    if (cd "$REPO" && "$PY" -m pip install --quiet --disable-pip-version-check "httpx[socks]>=0.27.2"); then
+      ok "httpx[socks] installed"
+    else
+      warn "pip install failed — run manually: $PY -m pip install 'httpx[socks]>=0.27.2'"
+    fi
+  else
+    warn "skipping dependency install (--no-deps). SOCKS proxies need: pip install 'httpx[socks]'"
+  fi
+
+  ###########################################################################
+  # 7. Backup + apply
+  ###########################################################################
+  log "Backing up originals to ${BACKUP}"
+  mkdir -p "$BACKUP"
+  : > "$BACKUP/manifest.txt"
+  for rel in "${STAGED[@]}"; do
+    if [ -f "$REPO/$rel" ]; then
+      mkdir -p "$BACKUP/$(dirname "$rel")"
+      cp -p "$REPO/$rel" "$BACKUP/$rel"
+      printf '%s|MOD\n' "$rel" >> "$BACKUP/manifest.txt"
+    else
+      printf '%s|NEW\n' "$rel" >> "$BACKUP/manifest.txt"
+    fi
+  done
+  ok "backup written (${#STAGED[@]} entries)"
+
+  log "Applying changes"
+  for rel in "${STAGED[@]}"; do
+    mkdir -p "$REPO/$(dirname "$rel")"
+    cp "$STAGE/$rel" "$REPO/$rel"
+  done
+  ok "applied ${#STAGED[@]} file(s)"
+fi
+
+###############################################################################
+# 8. Verification
+###############################################################################
+log "Verifying"
+VERIFY_FAILED=0
+
+if ! (cd "$REPO" && "$PY" -m compileall -q app tests >/dev/null); then
+  err "byte-compilation failed"
+  VERIFY_FAILED=1
+else
+  ok "byte-compilation"
+fi
+
+HAVE_DEPS=1
+if ! (cd "$REPO" && "$PY" -c 'import fastapi, celery, pydantic, redis, httpx' >/dev/null 2>&1); then
+  HAVE_DEPS=0
+  warn "runtime dependencies missing — skipping import + pytest"
+  warn "install them with: $PY -m pip install -r requirements-dev.txt"
+fi
+
+if [ "$HAVE_DEPS" -eq 1 ]; then
+  if (cd "$REPO" && "$PY" -c 'import app.main' >/dev/null 2>&1); then
+    ok "application imports cleanly"
+  else
+    err "import app.main failed:"
+    (cd "$REPO" && "$PY" -c 'import app.main') || true
+    VERIFY_FAILED=1
+  fi
+
+  if [ "$RUN_TESTS" -eq 1 ]; then
+    if ! "$PY" -c 'import pytest' >/dev/null 2>&1; then
+      if [ "$INSTALL_DEPS" -eq 1 ]; then
+        log "Installing pytest"
+        "$PY" -m pip install --quiet --disable-pip-version-check pytest pytest-asyncio || true
+      fi
+    fi
+    if "$PY" -c 'import pytest' >/dev/null 2>&1; then
+      log "Running test suite"
+      if (cd "$REPO" && "$PY" -m pytest -q); then
+        ok "test suite passed"
+      else
+        err "test suite failed"
+        VERIFY_FAILED=1
+      fi
+    else
+      warn "pytest unavailable — test suite skipped"
+    fi
+  else
+    warn "test suite skipped (--no-tests)"
+  fi
+fi
+
+###############################################################################
+# 9. Rollback on failure
+###############################################################################
+if [ "$VERIFY_FAILED" -ne 0 ]; then
+  err "verification failed"
+  if [ "$VERIFY_ONLY" -eq 0 ] && [ "$AUTO_ROLLBACK" -eq 1 ]; then
+    warn "rolling back to the pre-patch state"
+    restore_from "$BACKUP"
+    err "repository restored. Re-run with --no-rollback to inspect the failure in place."
+  else
+    warn "changes left in place. Backup: $BACKUP"
+  fi
+  exit 1
+fi
+
+ok "all checks passed"
+
+###############################################################################
+# 10. Summary
+###############################################################################
+cat <<SUMMARY
+
+${C_GRN}LeakGuard fixes F1–F9 applied successfully.${C_RESET}
+
+  F2  browser-side fingerprint + WebRTC + public IP; server harness labelled
+  F3  fail-closed analyzer: PASS / REVIEW / FAIL / INCONCLUSIVE + coverage
+  F4  httpx[socks] installed; socks5h + proxy credentials handled
+  F5  proxy-aware DNS/STUN (no more fabricated critical leaks)
+  F6  volatile-lru Redis, bigger worker, broker timeouts, bounded redelivery
+  F7  hardened fetch/poll (timeouts, res.ok, backoff, 429, 300s budget)
+  F8  usable proxy placeholder + real 422 messages
+  F9  copyable scan_id, attach command, per-visitor history
+
+Backup:   ${BACKUP}
+Rollback: bash fix_leakguard.sh --restore ${BACKUP}
+Details:  docs/FIXES_F1_F9.md
+
+${C_BLU}Next steps${C_RESET}
+  1. Local:  redis-server &
+             make dev          # terminal 1
+             make worker       # terminal 2
+  2. Render: commit + push, then re-sync the Blueprint so the worker plan
+     (standard) and Redis policy (volatile-lru) actually take effect.
+  3. Confirm: curl -s https://<app>/health   -> "celery_workers": true
+              curl -s https://<app>/ready    -> "redis": true
+  4. Open the UI, keep "Use my browser" checked, and run a scan.
+     A green PASS now means measured AND clean.
+
+SUMMARY
+

@@ -5,320 +5,635 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>LeakGuard - Anonymity Test</title>
 <style>
-  * { box-sizing: border-box; }
-  body { font-family: ui-sans-serif, system-ui, sans-serif; max-width: 900px;
-         margin: 2rem auto; padding: 0 1rem; background: #f6f7f9; color: #111; }
-  h1 { margin-bottom: 0.25rem; }
-  .subtitle { color: #666; margin-top: 0; }
-  .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px;
-          padding: 1.25rem; margin: 1rem 0; box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
-  .card h2 { margin-top: 0; font-size: 1.15rem; }
-  .card h3 { font-size: 1rem; margin: 1rem 0 0.5rem 0; color: #374151; }
-  label { display: block; margin-bottom: 0.4rem; font-weight: 500; }
-  input { width: 100%; max-width: 460px; padding: 0.55rem; border: 1px solid #d1d5db;
-          border-radius: 6px; font-size: 1rem; }
-  button { padding: 0.6rem 1.25rem; font-size: 1rem; cursor: pointer;
-           background: #1f6feb; color: #fff; border: none; border-radius: 6px;
-           margin-top: 0.75rem; }
-  button:disabled { background: #9ca3af; cursor: not-allowed; }
-  button.secondary { background: #6b7280; }
-  .status { color: #6b7280; margin-top: 0.75rem; font-style: italic; }
-  .status.running { color: #1f6feb; font-style: normal; }
-  .status.done { color: #16a34a; font-style: normal; font-weight: 500; }
-  .status.error { color: #dc2626; font-style: normal; font-weight: 500; }
-  .scorebox { display: flex; align-items: center; gap: 1rem; margin-bottom: 1rem;
-              padding: 1rem; border-radius: 8px; background: #f9fafb; }
-  .score { font-size: 2.5rem; font-weight: 700; line-height: 1; }
-  .score.pass { color: #16a34a; } .score.review { color: #d97706; }
-  .score.fail { color: #dc2626; }
-  .verdict { font-size: 1.25rem; font-weight: 600; }
-  .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px;
-           font-size: 0.75rem; font-weight: 600; text-transform: uppercase;
-           margin-right: 0.4rem; }
-  .badge.critical { background: #fee2e2; color: #991b1b; }
-  .badge.warning  { background: #fef3c7; color: #92400e; }
-  .badge.info     { background: #e0e7ff; color: #3730a3; }
-  .finding { padding: 0.6rem 0; border-bottom: 1px solid #f3f4f6; }
-  .finding:last-child { border-bottom: none; }
-  .finding-title { font-weight: 600; }
-  .finding-detail { color: #555; font-size: 0.9rem; margin-top: 0.15rem; }
-  table { width: 100%; border-collapse: collapse; margin: 0.5rem 0; }
-  td { padding: 0.4rem 0.6rem; border-bottom: 1px solid #f3f4f6;
-       font-size: 0.925rem; vertical-align: top; }
-  td:first-child { font-weight: 500; color: #374151; width: 42%; }
-  td:last-child { font-family: ui-monospace, SFMono-Regular, monospace; color: #111;
-                  word-break: break-all; }
-  pre { background: #f9fafb; border: 1px solid #e5e7eb; padding: 0.75rem;
-        border-radius: 6px; overflow: auto; font-size: 0.85rem; }
-  .history-row { padding: 0.45rem 0; border-bottom: 1px solid #f3f4f6;
-                 font-size: 0.9rem; }
-  .history-row:last-child { border-bottom: none; }
-  .history-row a { color: #1f6feb; text-decoration: none; }
-  .history-row a:hover { text-decoration: underline; }
-  details summary { cursor: pointer; color: #1f6feb; margin-top: 1rem; }
+* { box-sizing: border-box; }
+body { font-family: ui-sans-serif, system-ui, sans-serif; max-width: 940px;
+  margin: 2rem auto; padding: 0 1rem; background: #f6f7f9; color: #111; }
+h1 { margin-bottom: 0.25rem; }
+.subtitle { color: #666; margin-top: 0; }
+.card { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px;
+  padding: 1.25rem; margin: 1rem 0; box-shadow: 0 1px 3px rgba(0,0,0,0.04); }
+.card h2 { margin-top: 0; font-size: 1.15rem; }
+.card h3 { font-size: 1rem; margin: 1rem 0 0.5rem 0; color: #374151; }
+label { display: block; margin-bottom: 0.4rem; font-weight: 500; }
+input[type=text] { width: 100%; max-width: 520px; padding: 0.55rem;
+  border: 1px solid #d1d5db; border-radius: 6px; font-size: 1rem; }
+.checkline { font-weight: 400; margin: 0.75rem 0 0 0; display: flex;
+  align-items: center; gap: 0.5rem; }
+button { padding: 0.6rem 1.25rem; font-size: 1rem; cursor: pointer;
+  background: #1f6feb; color: #fff; border: none; border-radius: 6px; margin-top: 0.75rem; }
+button:disabled { background: #9ca3af; cursor: not-allowed; }
+button.secondary { background: #6b7280; }
+button.small { padding: 0.25rem 0.6rem; font-size: 0.8rem; margin-top: 0; }
+.hint { color: #6b7280; font-size: 0.85rem; margin: 0.4rem 0 0 0; }
+.notice { background: #eef2ff; border: 1px solid #c7d2fe; color: #3730a3;
+  border-radius: 6px; padding: 0.75rem; font-size: 0.9rem; }
+.status { color: #6b7280; margin-top: 0.75rem; font-style: italic; }
+.status.running { color: #1f6feb; font-style: normal; }
+.status.done { color: #16a34a; font-style: normal; font-weight: 500; }
+.status.error { color: #dc2626; font-style: normal; font-weight: 500; }
+.scanid { display: none; margin-top: 0.6rem; font-size: 0.85rem; color: #374151; }
+.scanid code { background: #f3f4f6; padding: 0.15rem 0.35rem; border-radius: 4px;
+  word-break: break-all; }
+.scorebox { display: flex; align-items: center; gap: 1rem; margin-bottom: 1rem;
+  padding: 1rem; border-radius: 8px; background: #f9fafb; }
+.score { font-size: 2.5rem; font-weight: 700; line-height: 1; }
+.score.pass { color: #16a34a; } .score.review { color: #d97706; }
+.score.fail { color: #dc2626; } .score.inconclusive { color: #6b7280; }
+.verdict { font-size: 1.25rem; font-weight: 600; }
+.cov { font-size: 0.85rem; color: #6b7280; margin: 0.25rem 0 0.5rem 0; }
+.badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px;
+  font-size: 0.75rem; font-weight: 600; text-transform: uppercase; margin-right: 0.4rem; }
+.badge.critical { background: #fee2e2; color: #991b1b; }
+.badge.warning  { background: #fef3c7; color: #92400e; }
+.badge.info     { background: #e0e7ff; color: #3730a3; }
+.finding { padding: 0.6rem 0; border-bottom: 1px solid #f3f4f6; }
+.finding:last-child { border-bottom: none; }
+.finding-title { font-weight: 600; }
+.finding-detail { color: #555; font-size: 0.9rem; margin-top: 0.15rem; }
+table { width: 100%; border-collapse: collapse; margin: 0.5rem 0; }
+td { padding: 0.4rem 0.6rem; border-bottom: 1px solid #f3f4f6;
+  font-size: 0.925rem; vertical-align: top; }
+td:first-child { font-weight: 500; color: #374151; width: 42%; }
+td:last-child { font-family: ui-monospace, SFMono-Regular, monospace; color: #111;
+  word-break: break-all; }
+pre { background: #f9fafb; border: 1px solid #e5e7eb; padding: 0.75rem;
+  border-radius: 6px; overflow: auto; font-size: 0.85rem; }
+.history-row { padding: 0.45rem 0; border-bottom: 1px solid #f3f4f6; font-size: 0.9rem; }
+.history-row:last-child { border-bottom: none; }
+.history-row a { color: #1f6feb; text-decoration: none; }
+.history-row a:hover { text-decoration: underline; }
+details summary { cursor: pointer; color: #1f6feb; margin-top: 1rem; }
 </style>
 </head>
 <body>
-  <h1>LeakGuard</h1>
-  <p class="subtitle">Multi-layer anonymity and leak verification.</p>
+<h1>LeakGuard</h1>
+<p class="subtitle">Multi-layer anonymity and leak verification.</p>
 
-  <div class="card">
-    <h2>Run a scan</h2>
-    <label for="proxy">Optional proxy URL (leave blank to test the server itself)</label>
-    <input id="proxy" type="text" placeholder="socks5://127.0.0.1:9050">
-    <button id="btn" onclick="runScan()">Scan</button>
-    <p id="status" class="status"></p>
-  </div>
+<div class="card">
+  <p class="notice">
+    <strong>What is measured where:</strong> the fingerprint and WebRTC checks run
+    in <em>your</em> browser. The public-IP / DNS / STUN checks run on the
+    <em>server</em> (or through the proxy you supply). Leave the proxy empty to
+    test this server's exit; supply one to test that exit instead.
+  </p>
+</div>
 
-  <div id="results"></div>
+<div class="card">
+  <h2>Run a scan</h2>
+  <label for="proxy">Proxy URL (optional)</label>
+  <input id="proxy" type="text" placeholder="socks5://proxy.example.com:1080" autocomplete="off">
+  <p class="hint">
+    Must be reachable <em>from the server</em>, not from your laptop. In production,
+    loopback and private-range hosts are rejected unless the operator sets
+    ALLOW_PRIVATE_PROXIES=1.
+  </p>
+  <label class="checkline">
+    <input id="use-client" type="checkbox" checked>
+    Use my browser for the fingerprint and WebRTC leak checks (recommended)
+  </label>
+  <button id="btn">Scan</button>
+  <p id="status" class="status"></p>
+  <p id="scanid" class="scanid"></p>
+</div>
 
-  <div class="card">
-    <h2>Local agent report</h2>
-    <p>Run <code>python agent/leakguard_agent.py --report &lt;this-url&gt;</code>
-       on your machine, then paste the returned scan_id here.</p>
-    <input id="agent-id" placeholder="scan_id (from agent output)">
-    <button class="secondary" onclick="loadAgent()">Load agent report</button>
-    <div id="agent-result"></div>
-  </div>
+<div id="results"></div>
 
-  <div class="card">
-    <h2>Recent scans</h2>
-    <button class="secondary" onclick="loadHistory()">Refresh</button>
-    <div id="history-list"></div>
-  </div>
+<div class="card">
+  <h2>Local agent report (Layer 3)</h2>
+  <p class="hint">
+    Run the agent on your own machine, then load its report here. After a scan,
+    use “Fill agent field” to attach it to that scan.
+  </p>
+  <input id="agent-id" type="text" placeholder="scan_id (from agent output)">
+  <button class="secondary" id="agent-load">Load agent report</button>
+  <div id="agent-result"></div>
+</div>
+
+<div class="card">
+  <h2>Recent scans (only yours)</h2>
+  <button class="secondary" id="history-refresh">Refresh</button>
+  <div id="history-list"></div>
+</div>
 
 <script>
-function setStatus(text, cls) {
-  const s = document.getElementById('status');
-  s.textContent = text;
-  s.className = 'status ' + (cls || '');
-}
-function esc(s) {
-  return String(s).replace(/[&<>"']/g, function(c) {
-    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
-  });
-}
-function row(k, v) { return '<tr><td>' + esc(k) + '</td><td>' + esc(v) + '</td></tr>'; }
+(function () {
+  'use strict';
 
-async function runScan() {
-  const proxy = document.getElementById('proxy').value.trim() || null;
-  const btn = document.getElementById('btn');
-  btn.disabled = true;
-  setStatus('Submitting...', 'running');
-  document.getElementById('results').innerHTML = '';
-  try {
-    const res = await fetch('/api/v1/scan', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ proxy_url: proxy }),
+  var API = '/api/v1';
+  var POLL_BUDGET_MS = 300000;
+  var pollToken = 0;
+  var currentScanId = null;
+
+  function $(id) { return document.getElementById(id); }
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  function esc(s) {
+    if (s === undefined || s === null) return '';
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
     });
-    if (!res.ok) throw new Error('submit ' + res.status);
-    const data = await res.json();
-    setStatus('Scanning... (' + data.scan_id.slice(0, 8) + ')', 'running');
-    poll(data.scan_id);
-  } catch (e) {
-    setStatus('Error: ' + e.message, 'error');
-    btn.disabled = false;
   }
-}
+  function row(k, v) { return '<tr><td>' + esc(k) + '</td><td>' + esc(v) + '</td></tr>'; }
+  function setStatus(text, cls) {
+    var s = $('status');
+    s.textContent = text;
+    s.className = 'status ' + (cls || '');
+  }
+  function verdictClass(v) {
+    if (v === 'PASS') return 'pass';
+    if (v === 'REVIEW') return 'review';
+    if (v === 'INCONCLUSIVE') return 'inconclusive';
+    return 'fail';
+  }
 
-async function poll(id) {
-  let n = 0;
-  const t = setInterval(async () => {
-    if (++n > 60) {
-      clearInterval(t);
-      setStatus('Timed out.', 'error');
-      document.getElementById('btn').disabled = false;
-      return;
+  function detailMessage(data) {
+    if (!data) return '';
+    var d = data.detail;
+    if (typeof d === 'string') return d;
+    if (Object.prototype.toString.call(d) === '[object Array]') {
+      return d.map(function (x) {
+        if (x && x.msg) return (x.loc ? x.loc.join('.') + ': ' : '') + x.msg;
+        return JSON.stringify(x);
+      }).join('; ');
     }
+    return '';
+  }
+
+  // F7: every request has a timeout, an ok-check and a real error message.
+  function apiFetch(path, opts, timeoutMs) {
+    opts = opts || {};
+    timeoutMs = timeoutMs || 20000;
+    var ctl = new AbortController();
+    var timer = setTimeout(function () { ctl.abort(); }, timeoutMs);
+    opts.signal = ctl.signal;
+    opts.credentials = 'same-origin';
+    return fetch(path, opts).then(function (res) {
+      clearTimeout(timer);
+      return res.text().then(function (text) {
+        var data = null;
+        try { data = text ? JSON.parse(text) : null; } catch (e) { data = null; }
+        if (!res.ok) {
+          var err = new Error(detailMessage(data) || ('HTTP ' + res.status));
+          err.status = res.status;
+          err.retryAfter = parseInt(res.headers.get('Retry-After') || '0', 10);
+          throw err;
+        }
+        if (data === null) throw new Error('Server returned a non-JSON response');
+        return data;
+      });
+    }, function (e) {
+      clearTimeout(timer);
+      if (e && e.name === 'AbortError') throw new Error('Request timed out');
+      throw new Error('Network error: ' + (e && e.message ? e.message : e));
+    });
+  }
+
+  // ---------------- F2: measurements taken in the visitor's browser ---------
+  function collectClientFingerprint() {
+    var fp = {
+      userAgent: navigator.userAgent,
+      language: navigator.language,
+      languages: navigator.languages ? Array.prototype.slice.call(navigator.languages, 0, 8) : [],
+      platform: navigator.platform,
+      timezone: (Intl.DateTimeFormat().resolvedOptions() || {}).timeZone,
+      screenWidth: screen.width,
+      screenHeight: screen.height,
+      colorDepth: screen.colorDepth,
+      hardwareConcurrency: navigator.hardwareConcurrency,
+      deviceMemory: navigator.deviceMemory,
+      webdriver: !!navigator.webdriver,
+      canvasHash: null,
+      webgl: null
+    };
     try {
-      const res = await fetch('/api/v1/scan/' + id);
-      const data = await res.json();
-      if (data.status === 'complete') {
-        clearInterval(t);
-        setStatus('Done.', 'done');
-        document.getElementById('btn').disabled = false;
-        render(data.result, id);
-        loadHistory();
-      } else if (data.status === 'failed') {
-        clearInterval(t);
-        setStatus('Failed: ' + (data.error || 'unknown'), 'error');
-        document.getElementById('btn').disabled = false;
+      var c = document.createElement('canvas');
+      var ctx = c.getContext('2d');
+      ctx.textBaseline = 'top';
+      ctx.font = '14px Arial';
+      ctx.fillStyle = '#f60';
+      ctx.fillRect(0, 0, 100, 20);
+      ctx.fillStyle = '#069';
+      ctx.fillText('fingerprint', 2, 2);
+      fp.canvasHash = c.toDataURL().slice(-50);
+    } catch (e) { /* canvas blocked */ }
+    try {
+      var gl = document.createElement('canvas').getContext('webgl');
+      if (gl) {
+        var dbg = gl.getExtension('WEBGL_debug_renderer_info');
+        if (dbg) {
+          fp.webgl = {
+            vendor: gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL),
+            renderer: gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)
+          };
+        }
       }
-    } catch (e) {
-      clearInterval(t);
-      setStatus('Poll error: ' + e.message, 'error');
-      document.getElementById('btn').disabled = false;
-    }
-  }, 2000);
-}
-
-function render(r, scanId) {
-  if (!r) return;
-  const cls = r.verdict === 'PASS' ? 'pass' : r.verdict === 'REVIEW' ? 'review' : 'fail';
-  let h = '<div class="card">';
-  h += '<div class="scorebox"><div class="score ' + cls + '">'
-     + esc(r.score) + '</div><div><div class="verdict">' + esc(r.verdict)
-     + '</div><div style="font-size:0.85rem;color:#666">score out of 100</div></div></div>';
-
-  h += '<h3>Findings</h3>';
-  const fs = r.findings || [];
-  if (fs.length === 0) h += '<p>No findings.</p>';
-  else {
-    for (const f of fs) {
-      h += '<div class="finding">'
-         + '<span class="badge ' + esc(f.severity) + '">' + esc(f.severity) + '</span>'
-         + '<span class="finding-title">' + esc(f.title) + '</span>'
-         + '<div class="finding-detail">' + esc(f.detail) + '</div></div>';
-    }
+    } catch (e) { /* webgl blocked */ }
+    return fp;
   }
 
-  h += '<h3>Layer 1 - Network identity</h3><table>';
-  const ip = (r.layer1 || {}).ip || {};
-  const dns = (r.layer1 || {}).dns || {};
-  const stun = (r.layer1 || {}).stun || {};
-  h += row('Public IPv4', ip.ipv4 || ip.error || 'n/a');
-  h += row('Public IPv6', ip.ipv6 || 'not detected');
-  h += row('DNS resolver IP', dns.resolver_seen_ip || dns.error || dns.reason || 'n/a');
-  h += row('STUN mapped IP', stun.mapped_ip || stun.error || 'n/a');
-  h += '</table>';
-
-  const geo = r.geo || {};
-  if (geo.status === 'ok') {
-    h += '<h3>IP geolocation</h3><table>';
-    h += row('Country', (geo.country || '?') + ' (' + (geo.country_code || '?') + ')');
-    h += row('City', geo.city || 'n/a');
-    h += row('Timezone', geo.timezone || 'n/a');
-    h += row('ISP', geo.isp || 'n/a');
-    h += '</table>';
+  function collectClientIp() {
+    var ctl = new AbortController();
+    var t = setTimeout(function () { ctl.abort(); }, 6000);
+    return fetch('https://api.ipify.org?format=json', { signal: ctl.signal })
+      .then(function (r) { clearTimeout(t); return r.json(); })
+      .then(function (j) { return j && j.ip ? j.ip : null; })
+      .catch(function () { clearTimeout(t); return null; });
   }
 
-  h += '<h3>Layer 2 - Browser fingerprint</h3>';
-  const l2 = r.layer2 || {};
-  if (l2.status === 'skipped') h += '<p>Skipped: ' + esc(l2.reason || 'unavailable') + '</p>';
-  else if (l2.status === 'error') h += '<p>Error: ' + esc(l2.error || 'unknown') + '</p>';
-  else {
-    const fp = l2.fingerprint || {};
-    h += '<table>';
-    h += row('User agent', fp.userAgent || 'n/a');
-    h += row('Language', fp.language || 'n/a');
-    h += row('Timezone', fp.timezone || 'n/a');
-    h += row('Platform', fp.platform || 'n/a');
-    h += row('Screen', (fp.screenWidth || '?') + 'x' + (fp.screenHeight || '?'));
-    h += row('CPU cores', fp.hardwareConcurrency || 'n/a');
-    h += row('Automation flag', fp.webdriver ? 'DETECTED (bot)' : 'clean');
-    if (fp.webgl) {
-      h += row('WebGL vendor', fp.webgl.vendor || 'n/a');
-      h += row('WebGL renderer', fp.webgl.renderer || 'n/a');
+  function collectWebRtcIps(timeoutMs) {
+    return new Promise(function (resolve) {
+      var out = { ips: [], mdns: false, status: 'error', error: null };
+      var settled = false;
+      var pc = null;
+      var timer = null;
+      function finish() {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        try { if (pc) pc.close(); } catch (e) {}
+        resolve(out);
+      }
+      var RTC = window.RTCPeerConnection || window.webkitRTCPeerConnection;
+      if (!RTC) {
+        out.status = 'skipped';
+        out.error = 'WebRTC unavailable in this browser';
+        return finish();
+      }
+      try {
+        pc = new RTC({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+      } catch (e) {
+        out.status = 'skipped';
+        out.error = String(e);
+        return finish();
+      }
+      timer = setTimeout(function () {
+        if (out.ips.length || out.mdns) out.status = 'ok';
+        else out.error = 'no ICE candidates gathered (STUN blocked?)';
+        finish();
+      }, timeoutMs || 4000);
+      pc.onicecandidate = function (ev) {
+        if (!ev.candidate) { out.status = 'ok'; return finish(); }
+        var parts = (ev.candidate.candidate || '').split(' ');
+        var addr = parts[4];
+        if (!addr) return;
+        if (/\.local$/i.test(addr)) { out.mdns = true; return; }
+        if (/^[0-9.]+$/.test(addr) || addr.indexOf(':') >= 0) {
+          if (out.ips.indexOf(addr) < 0) out.ips.push(addr);
+        }
+      };
+      try {
+        pc.createDataChannel('leakguard');
+        pc.createOffer()
+          .then(function (o) { return pc.setLocalDescription(o); })
+          .catch(function (e) { out.error = String(e); });
+      } catch (e) { out.error = String(e); }
+    });
+  }
+
+  function measureClient() {
+    var fp = collectClientFingerprint();
+    return Promise.all([collectClientIp(), collectWebRtcIps(4000)]).then(function (r) {
+      var ip = r[0], rtc = r[1];
+      return {
+        fp: fp,
+        net: {
+          status: ip ? 'ok' : 'error',
+          public_ip: ip,
+          error: ip ? null : 'could not reach the IP echo from your browser',
+          webrtc_status: rtc.status,
+          webrtc_ips: rtc.ips.slice(0, 16),
+          mdns_only: rtc.mdns && rtc.ips.length === 0,
+          webrtc_error: rtc.error
+        }
+      };
+    });
+  }
+
+  // ------------------------------- scan flow --------------------------------
+  function showScanId(id) {
+    var box = $('scanid');
+    box.innerHTML = 'scan_id: <code>' + esc(id) + '</code> ' +
+      '<button class="secondary small" data-action="copy-id" data-id="' + esc(id) + '">Copy</button>';
+    box.style.display = 'block';
+  }
+
+  function runScan() {
+    var btn = $('btn');
+    var proxy = $('proxy').value.trim();
+    var token = ++pollToken;
+    btn.disabled = true;
+    $('results').innerHTML = '';
+    setStatus('Preparing...', 'running');
+
+    var payload = { proxy_url: proxy || null };
+    var prep = Promise.resolve();
+    if ($('use-client').checked) {
+      setStatus('Measuring your browser (up to 6s)...', 'running');
+      prep = measureClient().then(function (m) {
+        payload.client_fingerprint = m.fp;
+        payload.client_network = m.net;
+      });
     }
-    h += '</table>';
+
+    prep.then(function () {
+      setStatus('Submitting...', 'running');
+      return apiFetch(API + '/scan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }, 30000);
+    }).then(function (data) {
+      currentScanId = data.scan_id;
+      showScanId(data.scan_id);
+      setStatus('Queued...', 'running');
+      return poll(data.scan_id, token);
+    }).catch(function (e) {
+      if (token === pollToken) setStatus('Error: ' + e.message, 'error');
+    }).then(function () {
+      btn.disabled = false;
+    });
   }
 
-  if (r.layer3) {
-    h += '<h3>Layer 3 - Local agent</h3><table>';
-    h += row('Platform', (r.layer3.platform || '?') + ' ' + (r.layer3.platform_version || ''));
-    h += row('Hostname', r.layer3.hostname || 'n/a');
-    h += row('VPN interfaces', (r.layer3.vpn_interfaces || []).join(', ') || 'none');
-    h += row('DNS resolvers', (r.layer3.dns_resolvers || []).join(', ') || 'n/a');
+  function poll(id, token) {
+    var deadline = Date.now() + POLL_BUDGET_MS;
+    var delay = 1500;
+    function step() {
+      if (token !== pollToken) return Promise.resolve();
+      if (Date.now() >= deadline) {
+        setStatus('Still running after 5 minutes. The worker may be down or out of ' +
+                  'memory. Check /health, then reopen this scan from "Recent scans".', 'error');
+        return Promise.resolve();
+      }
+      return apiFetch(API + '/scan/' + encodeURIComponent(id), {}, 15000)
+        .then(function (data) {
+          if (token !== pollToken) return null;
+          if (data.status === 'complete') {
+            setStatus('Done.', 'done');
+            render(data.result, id);
+            loadHistory();
+            return null;
+          }
+          if (data.status === 'failed') {
+            setStatus('Failed: ' + (data.error || 'unknown'), 'error');
+            return null;
+          }
+          setStatus(data.status === 'running'
+            ? 'Scanning...' : 'Queued - waiting for a worker...', 'running');
+          return sleep(delay).then(function () {
+            delay = Math.min(Math.round(delay * 1.4), 8000);
+            return step();
+          });
+        }, function (e) {
+          if (token !== pollToken) return null;
+          if (e.status === 429) {
+            return sleep(Math.max(5000, (e.retryAfter || 5) * 1000)).then(step);
+          }
+          if (e.status && e.status >= 400 && e.status < 500 && e.status !== 404) {
+            setStatus('Error: ' + e.message, 'error');
+            return null;
+          }
+          return sleep(delay).then(function () {
+            delay = Math.min(Math.round(delay * 1.6), 10000);
+            return step();
+          });
+        });
+    }
+    return step();
+  }
+
+  // ------------------------------- rendering --------------------------------
+  function render(r, scanId) {
+    if (!r) return;
+    var cls = verdictClass(r.verdict);
+    var h = '<div class="card">';
+    h += '<div class="scorebox"><div class="score ' + cls + '">' + esc(r.score) +
+         '</div><div><div class="verdict">' + esc(r.verdict) +
+         '</div><div style="font-size:0.85rem;color:#666">score out of 100</div></div></div>';
+
+    var cov = r.coverage;
+    if (cov) {
+      h += '<p class="cov">Checks measured: ' + esc(cov.measured) + ' / ' + esc(cov.applicable) +
+           (cov.complete ? '' : ' &mdash; <strong>incomplete, verdict is not a clean bill of health</strong>') +
+           '</p><table>';
+      var cs = cov.checks || [];
+      for (var i = 0; i < cs.length; i++) h += row(cs[i].name, cs[i].state);
+      h += '</table>';
+    }
+
+    h += '<h3>Findings</h3>';
+    var fs = r.findings || [];
+    if (!fs.length) h += '<p>No findings.</p>';
+    for (var j = 0; j < fs.length; j++) {
+      var f = fs[j];
+      h += '<div class="finding"><span class="badge ' + esc(f.severity) + '">' +
+           esc(f.severity) + '</span><span class="finding-title">' + esc(f.title) +
+           '</span><div class="finding-detail">' + esc(f.detail) + '</div></div>';
+    }
+
+    var l1 = r.layer1 || {};
+    var ip = l1.ip || {}, dns = l1.dns || {}, stun = l1.stun || {}, cl = l1.client || {};
+    h += '<h3>Layer 1 - Server / proxy network identity</h3><table>';
+    h += row('Exit IPv4', ip.ipv4 || ip.error || 'n/a');
+    h += row('Exit IPv6', ip.ipv6 || 'not detected');
+    h += row('DNS resolver IP', dns.resolver_seen_ip || dns.error || dns.reason || 'n/a');
+    h += row('STUN mapped IP', stun.mapped_ip || stun.error || stun.reason || 'n/a');
+    h += row('Proxy used', l1.proxy_used ? (r.proxy_url || 'yes') : 'no');
     h += '</table>';
-    const ifs = r.layer3.interfaces || [];
-    if (ifs.length) {
+
+    if (cl.public_ip || cl.webrtc_status) {
+      h += '<h3>Layer 1c - Your browser network</h3><table>';
+      h += row('Browser public IP', cl.public_ip || cl.error || 'n/a');
+      h += row('WebRTC check', cl.webrtc_status || 'n/a');
+      h += row('WebRTC candidates', (cl.webrtc_ips || []).join(', ') ||
+               (cl.mdns_only ? 'mDNS obfuscated (good)' : (cl.webrtc_error || 'none')));
+      h += '</table>';
+    }
+
+    var geo = r.geo || {};
+    if (geo.status === 'ok') {
+      h += '<h3>Exit IP geolocation</h3><table>';
+      h += row('Country', (geo.country || '?') + ' (' + (geo.country_code || '?') + ')');
+      h += row('City', geo.city || 'n/a');
+      h += row('Timezone', geo.timezone || 'n/a');
+      h += row('ISP', geo.isp || 'n/a');
+      h += '</table>';
+    }
+
+    var l2 = r.layer2 || {};
+    h += '<h3>Layer 2 - Browser fingerprint (' + esc(l2.source || 'unknown') + ')</h3>';
+    if (l2.source === 'server') {
+      h += '<p class="hint">Measured by the server harness. Its automation flag and ' +
+           'container timezone are artifacts and are not scored against you.</p>';
+    }
+    if (l2.status === 'skipped') h += '<p>Skipped: ' + esc(l2.reason || 'unavailable') + '</p>';
+    else if (l2.status === 'error') h += '<p>Error: ' + esc(l2.error || 'unknown') + '</p>';
+    else {
+      var fp = l2.fingerprint || {};
       h += '<table>';
-      for (const i of ifs) {
-        h += row(i.name + ' MAC', i.mac + (i.randomized ? ' (randomized)' : ' (permanent)'));
+      h += row('User agent', fp.userAgent || 'n/a');
+      h += row('Language', fp.language || 'n/a');
+      h += row('Timezone', fp.timezone || 'n/a');
+      h += row('Platform', fp.platform || 'n/a');
+      h += row('Screen', (fp.screenWidth || '?') + 'x' + (fp.screenHeight || '?'));
+      h += row('CPU cores', fp.hardwareConcurrency || 'n/a');
+      h += row('Automation flag', fp.webdriver ? 'DETECTED (bot)' : 'clean');
+      if (fp.webgl) {
+        h += row('WebGL vendor', fp.webgl.vendor || 'n/a');
+        h += row('WebGL renderer', fp.webgl.renderer || 'n/a');
       }
       h += '</table>';
     }
-  }
 
-  h += '<details><summary>Raw JSON</summary><pre>'
-     + esc(JSON.stringify(r, null, 2)) + '</pre></details>';
-  if (scanId) {
-    h += '<button class="secondary" onclick="download(\'' + esc(scanId) + '\')">'
-       + 'Download JSON</button>';
-  }
-  h += '</div>';
-  document.getElementById('results').innerHTML = h;
-}
-
-function download(scanId) {
-  window.location = '/api/v1/scan/' + scanId + '/export';
-}
-
-async function loadAgent() {
-  const id = document.getElementById('agent-id').value.trim();
-  if (!id) return;
-  const out = document.getElementById('agent-result');
-  out.innerHTML = '<p>Loading...</p>';
-  try {
-    const res = await fetch('/api/v1/agent/' + id);
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const data = await res.json();
-    let h = '<table>';
-    for (const k of ['scan_id', 'platform', 'platform_version', 'hostname']) {
-      if (data[k]) h += row(k, data[k]);
-    }
-    if (data.vpn_interfaces) h += row('VPN interfaces', data.vpn_interfaces.join(', ') || 'none');
-    if (data.dns_resolvers) h += row('DNS resolvers', data.dns_resolvers.join(', ') || 'n/a');
-    h += '</table>';
-    const ifs = data.interfaces || [];
-    if (ifs.length) {
-      h += '<table>';
-      for (const i of ifs) {
-        h += row(i.name + ' MAC', i.mac + (i.randomized ? ' (randomized)' : ' (permanent)'));
-      }
+    if (r.layer3) {
+      h += '<h3>Layer 3 - Local agent</h3><table>';
+      h += row('Platform', (r.layer3.platform || '?') + ' ' + (r.layer3.platform_version || ''));
+      h += row('Hostname', r.layer3.hostname || 'n/a');
+      h += row('VPN interfaces', (r.layer3.vpn_interfaces || []).join(', ') || 'none');
+      h += row('DNS resolvers', (r.layer3.dns_resolvers || []).join(', ') || 'n/a');
       h += '</table>';
+      var ifs = r.layer3.interfaces || [];
+      if (ifs.length) {
+        h += '<table>';
+        for (var k = 0; k < ifs.length; k++) {
+          var it = ifs[k];
+          h += row((it.name || '?') + ' MAC',
+                   (it.mac || '?') + (it.randomized ? ' (randomized)' : ' (permanent)'));
+        }
+        h += '</table>';
+      }
     }
-    h += '<details><summary>Raw JSON</summary><pre>'
-       + esc(JSON.stringify(data, null, 2)) + '</pre></details>';
-    out.innerHTML = h;
-  } catch (e) {
-    out.innerHTML = '<p style="color:#dc2626">' + esc(e.message) + '</p>';
-  }
-}
 
-async function loadHistory() {
-  const out = document.getElementById('history-list');
-  try {
-    const res = await fetch('/api/v1/history');
-    const data = await res.json();
-    const scans = data.scans || [];
-    if (scans.length === 0) { out.innerHTML = '<p>No scans yet.</p>'; return; }
-    let h = '';
-    for (const s of scans) {
-      const cls = s.verdict === 'PASS' ? 'pass' : s.verdict === 'REVIEW' ? 'review' : 'fail';
-      h += '<div class="history-row"><a href="#" onclick="loadScan(\''
-         + esc(s.scan_id) + '\');return false">'
-         + esc(s.scan_id.slice(0, 8)) + '</a> &middot; '
-         + '<span class="score ' + cls + '" style="font-size:1rem">'
-         + esc(s.score) + '</span> &middot; '
-         + esc(s.verdict) + ' &middot; '
-         + esc(s.public_ip || 'n/a') + '</div>';
+    h += '<details><summary>Raw JSON</summary><pre>' +
+         esc(JSON.stringify(r, null, 2)) + '</pre></details>';
+
+    if (scanId) {
+      var cmd = 'python agent/leakguard_agent.py --report ' + location.origin +
+                ' --attach ' + scanId;
+      h += '<h3>Attach the local agent (Layer 3)</h3>';
+      h += '<pre id="agent-cmd">' + esc(cmd) + '</pre>';
+      h += '<button class="secondary" data-action="copy-cmd">Copy command</button> ';
+      h += '<button class="secondary" data-action="attach" data-id="' + esc(scanId) +
+           '">Fill agent field</button> ';
+      h += '<button class="secondary" data-action="download" data-id="' + esc(scanId) +
+           '">Download JSON</button>';
     }
-    out.innerHTML = h;
-  } catch (e) {
-    out.innerHTML = '<p style="color:#dc2626">' + esc(e.message) + '</p>';
+    h += '</div>';
+    $('results').innerHTML = h;
   }
-}
 
-async function loadScan(id) {
-  try {
-    const res = await fetch('/api/v1/scan/' + id);
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const data = await res.json();
-    if (data.status === 'complete') {
-      render(data.result, id);
-    } else if (data.status === 'failed') {
-      setStatus('Failed: ' + (data.error || 'unknown'), 'error');
-    } else {
-      setStatus('Scan ' + id.slice(0, 8) + ' is ' + data.status, 'running');
+  function copyText(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+      return navigator.clipboard.writeText(text);
     }
-  } catch (e) {
-    setStatus('Load error: ' + e.message, 'error');
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); } catch (e) {}
+    document.body.removeChild(ta);
+    return Promise.resolve();
   }
-}
 
-loadHistory();
+  function onActionClick(ev) {
+    var el = ev.target;
+    while (el && el !== ev.currentTarget && !el.getAttribute('data-action')) el = el.parentNode;
+    if (!el || el === ev.currentTarget) return;
+    var action = el.getAttribute('data-action');
+    var id = el.getAttribute('data-id') || currentScanId;
+    if (action === 'copy-id' && id) {
+      copyText(id).then(function () { setStatus('scan_id copied.', 'done'); });
+    } else if (action === 'copy-cmd') {
+      var pre = $('agent-cmd');
+      if (pre) copyText(pre.textContent).then(function () { setStatus('Command copied.', 'done'); });
+    } else if (action === 'attach' && id) {
+      $('agent-id').value = id;
+      $('agent-id').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    } else if (action === 'download' && id) {
+      window.location = API + '/scan/' + encodeURIComponent(id) + '/export';
+    } else if (action === 'open-scan' && id) {
+      ev.preventDefault();
+      loadScan(id);
+    }
+  }
+
+  function loadAgent() {
+    var id = $('agent-id').value.trim();
+    if (!id) return;
+    var out = $('agent-result');
+    out.innerHTML = '<p>Loading...</p>';
+    apiFetch(API + '/agent/' + encodeURIComponent(id), {}, 15000).then(function (data) {
+      var h = '<table>';
+      ['scan_id', 'platform', 'platform_version', 'hostname'].forEach(function (k) {
+        if (data[k]) h += row(k, data[k]);
+      });
+      h += row('VPN interfaces', (data.vpn_interfaces || []).join(', ') || 'none');
+      h += row('DNS resolvers', (data.dns_resolvers || []).join(', ') || 'n/a');
+      h += '</table>';
+      var ifs = data.interfaces || [];
+      if (ifs.length) {
+        h += '<table>';
+        ifs.forEach(function (i) {
+          h += row((i.name || '?') + ' MAC',
+                   (i.mac || '?') + (i.randomized ? ' (randomized)' : ' (permanent)'));
+        });
+        h += '</table>';
+      }
+      h += '<details><summary>Raw JSON</summary><pre>' +
+           esc(JSON.stringify(data, null, 2)) + '</pre></details>';
+      out.innerHTML = h;
+      if (data.scan_id) loadScan(data.scan_id);
+    }).catch(function (e) {
+      out.innerHTML = '<p style="color:#dc2626">' + esc(e.message) + '</p>';
+    });
+  }
+
+  function loadHistory() {
+    var out = $('history-list');
+    apiFetch(API + '/history', {}, 15000).then(function (data) {
+      var scans = data.scans || [];
+      if (!scans.length) { out.innerHTML = '<p>No scans yet.</p>'; return; }
+      var h = '';
+      scans.forEach(function (s) {
+        var cls = verdictClass(s.verdict);
+        var score = (s.score === undefined || s.score === null) ? '?' : s.score;
+        h += '<div class="history-row"><a href="#" data-action="open-scan" data-id="' +
+             esc(s.scan_id) + '">' + esc(String(s.scan_id).slice(0, 8)) + '</a> &middot; ' +
+             '<span class="score ' + cls + '" style="font-size:1rem">' + esc(score) +
+             '</span> &middot; ' + esc(s.verdict || 'pending') + ' &middot; ' +
+             esc(s.public_ip || 'n/a') + '</div>';
+      });
+      out.innerHTML = h;
+    }).catch(function (e) {
+      out.innerHTML = '<p style="color:#dc2626">' + esc(e.message) + '</p>';
+    });
+  }
+
+  function loadScan(id) {
+    return apiFetch(API + '/scan/' + encodeURIComponent(id), {}, 15000).then(function (data) {
+      currentScanId = id;
+      showScanId(id);
+      if (data.status === 'complete') { setStatus('Done.', 'done'); render(data.result, id); }
+      else if (data.status === 'failed') setStatus('Failed: ' + (data.error || 'unknown'), 'error');
+      else setStatus('Scan ' + String(id).slice(0, 8) + ' is ' + data.status, 'running');
+    }).catch(function (e) {
+      setStatus('Load error: ' + e.message, 'error');
+    });
+  }
+
+  $('btn').addEventListener('click', runScan);
+  $('agent-load').addEventListener('click', loadAgent);
+  $('history-refresh').addEventListener('click', loadHistory);
+  $('results').addEventListener('click', onActionClick);
+  $('scanid').addEventListener('click', onActionClick);
+  $('history-list').addEventListener('click', onActionClick);
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden && currentScanId) loadScan(currentScanId);
+  });
+
+  loadHistory();
+})();
 </script>
 </body>
 </html>

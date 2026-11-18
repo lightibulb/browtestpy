@@ -14,11 +14,78 @@ class ScanStatus(str, Enum):
     FAILED = "failed"
 
 
+class ClientFingerprint(BaseModel):
+    """Fingerprint measured in the visitor's own browser (F2)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    userAgent: str | None = Field(default=None, max_length=512)
+    language: str | None = Field(default=None, max_length=64)
+    languages: list[str] = Field(default_factory=list, max_length=16)
+    platform: str | None = Field(default=None, max_length=128)
+    timezone: str | None = Field(default=None, max_length=128)
+    screenWidth: int | None = Field(default=None, ge=0, le=100000)
+    screenHeight: int | None = Field(default=None, ge=0, le=100000)
+    colorDepth: int | None = Field(default=None, ge=0, le=64)
+    hardwareConcurrency: int | None = Field(default=None, ge=0, le=4096)
+    deviceMemory: float | None = Field(default=None, ge=0, le=4096)
+    webdriver: bool | None = None
+    canvasHash: str | None = Field(default=None, max_length=256)
+    webgl: dict | None = None
+
+
+class ClientNetwork(BaseModel):
+    """IP / WebRTC measurements made in the visitor's own browser (F2/F5)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    status: str = Field(default="ok", pattern=r"^(ok|error|skipped)$")
+    public_ip: str | None = Field(default=None, max_length=64)
+    public_ipv6: str | None = Field(default=None, max_length=64)
+    webrtc_status: str = Field(default="skipped", pattern=r"^(ok|error|skipped)$")
+    webrtc_ips: list[str] = Field(default_factory=list, max_length=32)
+    mdns_only: bool = False
+    error: str | None = Field(default=None, max_length=512)
+    webrtc_error: str | None = Field(default=None, max_length=512)
+
+    @field_validator("public_ip", "public_ipv6")
+    @classmethod
+    def _validate_ip(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        try:
+            ip_address(v)
+        except ValueError:
+            raise ValueError("not a valid IP address: " + str(v))
+        return v
+
+    @field_validator("webrtc_ips")
+    @classmethod
+    def _validate_ips(cls, v: list[str]) -> list[str]:
+        out = []
+        for item in v[:32]:
+            try:
+                ip_address(item)
+            except (ValueError, TypeError):
+                continue
+            out.append(str(item))
+        return out
+
+
 class ScanRequest(BaseModel):
     # Payload accepted by POST /api/v1/scan.
     proxy_url: str | None = Field(
         default=None,
         description="Optional proxy URL (e.g. socks5://127.0.0.1:9050).",
+    )
+
+    client_fingerprint: ClientFingerprint | None = Field(
+        default=None,
+        description="Fingerprint measured in the visitor's own browser.",
+    )
+    client_network: ClientNetwork | None = Field(
+        default=None,
+        description="IP / WebRTC measurements from the visitor's own browser.",
     )
 
     @field_validator("proxy_url")

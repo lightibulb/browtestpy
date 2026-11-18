@@ -2,8 +2,8 @@
 #
 # Plans:
 #   - web:    free     (sleeps after 15 min idle; ~30s cold start on wake)
-#   - worker: starter  (paid — Render offers no free background worker plan)
-#   - redis:  free     (25 MB, allkeys-lru eviction; results + history + agent
+#   - worker: standard  (paid — Render offers no free background worker plan)
+#   - redis:  free     (25 MB, volatile-lru eviction; results + history + agent
 #                       reports share this budget. Upgrade if you run many
 #                       scans or expect large Playwright fingerprints.)
 #
@@ -59,7 +59,7 @@ services:
     dockerfilePath: ./Dockerfile
     dockerContext: .
     dockerCommand: celery -A app.core.celery_app.celery worker --loglevel=info --pool=solo
-    plan: starter
+    plan: standard
     region: oregon
     autoDeploy: true
     envVars:
@@ -86,4 +86,7 @@ services:
     plan: free
     region: oregon
     ipAllowList: []
-    maxmemoryPolicy: allkeys-lru
+    # F6: volatile-lru only evicts keys that carry a TTL (results,
+    # summaries, agent reports). Celery queue keys have no TTL, so the
+    # broker can no longer silently drop queued scans.
+    maxmemoryPolicy: volatile-lru

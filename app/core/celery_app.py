@@ -23,6 +23,15 @@ celery.conf.update(
     task_time_limit=300,
     task_soft_time_limit=240,
     worker_prefetch_multiplier=1,
+    # F6: fail fast when Redis is unreachable and bound redelivery.
+    broker_transport_options={"visibility_timeout": 900},
+    broker_connection_timeout=3,
+    broker_connection_max_retries=3,
+    result_backend_transport_options={
+        "socket_connect_timeout": 3,
+        "socket_timeout": 3,
+        "health_check_interval": 30,
+    },
 )
 
 # Import task modules explicitly so both web and worker register them.

@@ -94,7 +94,13 @@ def test_errors_do_not_create_false_positives():
         "stun": {"status": "error", "error": "timeout"},
     }
     a = analyze(l1, {"status": "skipped"})
-    assert a["verdict"] == "PASS"
+    # F3: errors are not a clean bill of health.
+    assert a["verdict"] == "INCONCLUSIVE"
+    assert a["coverage"]["complete"] is False
+    ids = [f["id"] for f in a["findings"]]
+    assert "dns_leak" not in ids
+    assert "webrtc_leak" not in ids
+    assert "dns_unmeasured" in ids
 
 
 def test_score_floors_at_zero():

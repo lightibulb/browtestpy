@@ -27,6 +27,26 @@ class FakeRedis:
     def lrange(self, key, start, stop):
         return self.lists.get(key, [])[start:stop + 1]
 
+    def expire(self, key, ttl):
+        return True
+
+    def incr(self, key):
+        n = int(self.store.get(key, 0)) + 1
+        self.store[key] = n
+        return n
+
+    def delete(self, key):
+        self.store.pop(key, None)
+        self.lists.pop(key, None)
+        return 1
+
+    def set(self, key, value, ex=None):
+        self.store[key] = value
+        return True
+
+    def exists(self, key):
+        return 1 if (key in self.store or key in self.lists) else 0
+
     def ping(self):
         return True
 

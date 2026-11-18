@@ -26,7 +26,7 @@ def test_errors_do_not_trigger_leaks_with_payloads():
     ids = [f["id"] for f in a["findings"]]
     assert "dns_leak" not in ids
     assert "webrtc_leak" not in ids
-    assert a["verdict"] == "PASS"
+    assert a["verdict"] == "INCONCLUSIVE"  # F3
 
 
 def test_ok_status_still_triggers_leaks():

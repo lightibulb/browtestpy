@@ -20,3 +20,5 @@ tests
 # repo snapshot dump (b.sh output)
 browtestpy.txt
 b.sh
+# fix_leakguard.sh backups
+.leakguard_fix_backup/

@@ -45,7 +45,9 @@ def test_scan_includes_layer3(client, fake_redis, monkeypatch):
     assert r.status_code == 200
     body = r.json()
     assert body["result"]["layer3"]["hostname"] == "h"
-    assert body["result"]["verdict"] == "REVIEW"
+    assert body["result"]["verdict"] in ("REVIEW", "INCONCLUSIVE")
+    assert any(f["id"].startswith("mac_permanent_")
+               for f in body["result"]["findings"])
 
 
 @pytest.mark.skipif(not HAS_MERGE, reason="requires H1 fix (_merge_layer3)")

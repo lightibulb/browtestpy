@@ -48,8 +48,10 @@ def test_history_empty(client, fake_redis, monkeypatch):
 
 
 def test_history_with_entries(client, fake_redis, monkeypatch):
+    # F9: history is scoped to the visitor's identity cookie.
     monkeypatch.setattr(routes, "get_redis", lambda: fake_redis)
-    fake_redis.lpush("scan_history", "abc")
+    client.cookies.set("lg_sid", "owner-test-0001")
+    fake_redis.lpush("scan_history:owner-test-0001", "abc")
     fake_redis.setex(
         "scan_summary:abc", 60,
         json.dumps({"verdict": "PASS", "score": 100, "public_ip": "1.2.3.4"}),
@@ -59,8 +61,6 @@ def test_history_with_entries(client, fake_redis, monkeypatch):
     scans = r.json()["scans"]
     assert len(scans) == 1
     assert scans[0]["verdict"] == "PASS"
-
-
 def test_agent_returns_503_when_redis_down(client, monkeypatch):
     monkeypatch.setattr(routes, "get_redis", lambda: None)
     r = client.post("/api/v1/agent", json={"hostname": "h"})
