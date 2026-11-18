@@ -4,6 +4,7 @@ import time
 import httpx
 
 CACHE_TTL = 3600
+CACHE_MAX_ENTRIES = 1024
 _cache = {}  # ip -> (timestamp, result)
 
 
@@ -11,10 +12,18 @@ def _cached(ip):
     hit = _cache.get(ip)
     if hit and (time.time() - hit[0]) < CACHE_TTL:
         return hit[1]
+    if hit:
+        _cache.pop(ip, None)
     return None
 
 
 def _store(ip, result):
+    if len(_cache) >= CACHE_MAX_ENTRIES:
+        try:
+            oldest = min(_cache.items(), key=lambda kv: kv[1][0])
+            _cache.pop(oldest[0], None)
+        except (ValueError, StopIteration):
+            pass
     _cache[ip] = (time.time(), result)
 
 
@@ -70,6 +79,5 @@ def lookup(ip, timeout=5.0):
             return result
         except Exception:
             continue
-    failure = {"status": "error", "reason": "all providers failed"}
-    _store(ip, failure)
-    return failure
+    # Do NOT cache failures — let the next request retry.
+    return {"status": "error", "reason": "all providers failed"}

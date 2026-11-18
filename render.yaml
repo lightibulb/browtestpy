@@ -1,5 +1,30 @@
+# Render Blueprint for LeakGuard.
+#
+# Plans:
+#   - web:    free     (sleeps after 15 min idle; ~30s cold start on wake)
+#   - worker: starter  (paid — Render offers no free background worker plan)
+#   - redis:  free     (25 MB, allkeys-lru eviction; results + history + agent
+#                       reports share this budget. Upgrade if you run many
+#                       scans or expect large Playwright fingerprints.)
+#
+# Health checks:
+#   - healthCheckPath: /health  (liveness — 200 unless the process is dead)
+#   - GET /ready                (readiness — 503 when Redis is unreachable;
+#                                point an external uptime monitor here, NOT
+#                                Render's healthCheckPath, to avoid restart
+#                                loops when Redis blips.)
+#
+# Port:
+#   Render injects $PORT at runtime; the Dockerfile honours it via
+#   `--port ${PORT:-8000}`. No port env var is needed in this file.
+#
+# Branch:
+#   `branch: main` is set explicitly on web and worker so a default-branch
+#   rename in the GitHub repo does not silently break the blueprint.
+#
 services:
   - type: web
+    branch: main
     name: anonymity-verifier-web
     runtime: docker
     dockerfilePath: ./Dockerfile
@@ -28,11 +53,12 @@ services:
           property: connectionString
 
   - type: worker
+    branch: main
     name: anonymity-verifier-worker
     runtime: docker
     dockerfilePath: ./Dockerfile
     dockerContext: .
-    dockerCommand: celery -A app.core.celery_app.celery worker --loglevel=info --concurrency=2
+    dockerCommand: celery -A app.core.celery_app.celery worker --loglevel=info --pool=solo
     plan: starter
     region: oregon
     autoDeploy: true
@@ -60,4 +86,4 @@ services:
     plan: free
     region: oregon
     ipAllowList: []
-    maxmemoryPolicy: noeviction
+    maxmemoryPolicy: allkeys-lru

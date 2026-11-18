@@ -16,3 +16,7 @@ reports
 .vscode
 .DS_Store
 tests
+
+# repo snapshot dump (b.sh output)
+browtestpy.txt
+b.sh

@@ -7,7 +7,7 @@ dev:
 	uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 worker:
-	celery -A app.core.celery_app.celery worker --loglevel=info
+	celery -A app.core.celery_app.celery worker --loglevel=info --pool=solo
 
 test:
 	pytest

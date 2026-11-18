@@ -29,6 +29,44 @@ def _run(cmd):
         return None
 
 
+def _looks_like_ip(text):
+    if not text:
+        return False
+    if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", text):
+        return True
+    if ":" in text and re.match(r"^[0-9a-fA-F:]+$", text):
+        return True
+    return False
+
+
+def _parse_windows_dns(out):
+    # ipconfig /all lists one "DNS Servers" header (English) or a localized
+    # equivalent, followed by indented continuation IPs.
+    resolvers = []
+    in_dns = False
+    for line in out.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            in_dns = False
+            continue
+        if ":" in line:
+            _, _, tail = line.rpartition(":")
+            tail = tail.strip()
+            if _looks_like_ip(tail):
+                if in_dns or "DNS" in line.upper():
+                    resolvers.append(tail)
+                    in_dns = True
+                    continue
+            if in_dns and _looks_like_ip(stripped):
+                resolvers.append(stripped)
+                continue
+            in_dns = False
+            continue
+        if in_dns and _looks_like_ip(stripped):
+            resolvers.append(stripped)
+    return resolvers
+
+
 def is_randomized_mac(mac):
     # Locally-administered bit is bit 1 of first octet.
     # In hex, that is the 2nd character being 2, 6, A, or E.
@@ -38,6 +76,21 @@ def is_randomized_mac(mac):
         return mac[1].upper() in {"2", "6", "A", "E"}
     except Exception:
         return None
+
+
+def is_pseudo_interface(iface):
+    # Loopback / virtual bridges / all-zero MACs are not trackable by observers.
+    name_ = (iface.get("name") or "").lower()
+    if (
+        name_ == "lo"
+        or name_.startswith("lo0")
+        or name_.startswith(("veth", "docker", "br-", "virbr", "vmnet", "ifb"))
+    ):
+        return True
+    mac = (iface.get("mac") or "").replace(":", "").replace("-", "").lower()
+    if not mac or set(mac) == {"0"}:
+        return True
+    return False
 
 
 def parse_linux_ip_link(text):
@@ -138,13 +191,7 @@ def collect_dns_resolvers():
     elif system == "Windows":
         out = _run(["ipconfig", "/all"])
         if out:
-            for line in out.splitlines():
-                if "DNS Servers" in line:
-                    parts = line.split(":")
-                    if len(parts) == 2:
-                        ip = parts[1].strip()
-                        if ip:
-                            resolvers.append(ip)
+            resolvers.extend(_parse_windows_dns(out))
     return resolvers
 
 
@@ -162,6 +209,8 @@ def build_report():
     }
 
     for iface in interfaces:
+        if is_pseudo_interface(iface):
+            continue
         if iface.get("randomized") is False:
             report["checks"].append({
                 "id": "mac_permanent_" + iface["name"],

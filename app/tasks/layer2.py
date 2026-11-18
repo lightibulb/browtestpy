@@ -54,6 +54,8 @@ FINGERPRINT_JS = (
 def collect_fingerprint(proxy_url=None):
     if not PLAYWRIGHT_AVAILABLE:
         return {"status": "skipped", "reason": "playwright module not installed"}
+    browser = None
+    context = None
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -67,7 +69,17 @@ def collect_fingerprint(proxy_url=None):
             page = context.new_page()
             page.goto("about:blank")
             fp = page.evaluate(FINGERPRINT_JS)
-            browser.close()
             return {"status": "ok", "fingerprint": fp}
     except Exception as exc:
         return {"status": "error", "error": str(exc)}
+    finally:
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass

@@ -1,1 +1,1 @@
-# Celery task modules. Imported by celery.autodiscover_tasks().
+# Celery task modules. Imported explicitly via celery.conf.imports.

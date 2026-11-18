@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     celery_broker_url: str | None = None
     celery_result_backend: str | None = None
     scan_result_ttl: int = 3600
+    allow_private_proxies: bool = False
 
     @property
     def broker_url(self) -> str:

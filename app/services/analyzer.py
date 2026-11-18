@@ -19,6 +19,21 @@ def _finding(fid, severity, title, detail):
     }
 
 
+def _is_pseudo_interface(iface):
+    # Loopback / virtual bridges / all-zero MACs are not trackable by observers.
+    name_ = (iface.get("name") or "").lower()
+    if (
+        name_ == "lo"
+        or name_.startswith("lo0")
+        or name_.startswith(("veth", "docker", "br-", "virbr", "vmnet", "ifb"))
+    ):
+        return True
+    mac = (iface.get("mac") or "").replace(":", "").replace("-", "").lower()
+    if not mac or set(mac) == {"0"}:
+        return True
+    return False
+
+
 def analyze(layer1, layer2, geo=None, layer3=None):
     # Signature is backward-compatible with Part 2 (geo/layer3 default to None).
     findings = []
@@ -36,14 +51,22 @@ def analyze(layer1, layer2, geo=None, layer3=None):
     resolver_ip = dns_data.get("resolver_seen_ip")
     mapped_ip = stun_data.get("mapped_ip")
 
-    if public_ip and resolver_ip and public_ip != resolver_ip:
+    dns_status = dns_data.get("status")
+    if (
+        (dns_status is None or dns_status == "ok")
+        and public_ip and resolver_ip and public_ip != resolver_ip
+    ):
         findings.append(_finding(
             "dns_leak", SEVERITY_CRITICAL,
             "DNS resolver IP differs from public IP",
             "Public IP " + public_ip + " but resolver seen as " + resolver_ip,
         ))
 
-    if public_ip and mapped_ip and public_ip != mapped_ip:
+    stun_status = stun_data.get("status")
+    if (
+        (stun_status is None or stun_status == "ok")
+        and public_ip and mapped_ip and public_ip != mapped_ip
+    ):
         findings.append(_finding(
             "webrtc_leak", SEVERITY_CRITICAL,
             "STUN/WebRTC leak detected",
@@ -81,6 +104,8 @@ def analyze(layer1, layer2, geo=None, layer3=None):
 
     if layer3 and layer3.get("interfaces"):
         for iface in layer3.get("interfaces", []):
+            if _is_pseudo_interface(iface):
+                continue
             if iface.get("randomized") is False:
                 findings.append(_finding(
                     "mac_permanent_" + str(iface.get("name")),

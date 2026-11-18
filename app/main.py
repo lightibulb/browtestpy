@@ -50,6 +50,14 @@ class RateLimiter:
         now = time()
         cutoff = now - self.window
         with self.lock:
+            # Bound memory: drop buckets whose newest request is stale.
+            if len(self.buckets) > 1000:
+                stale = [
+                    k for k, ts in self.buckets.items()
+                    if not ts or max(ts) < cutoff
+                ]
+                for k in stale:
+                    self.buckets.pop(k, None)
             bucket = [t for t in self.buckets[key] if t > cutoff]
             if len(bucket) >= self.max:
                 self.buckets[key] = bucket
@@ -65,7 +73,11 @@ limiter = RateLimiter(max_requests=60, window_seconds=60)
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     if request.url.path.startswith("/api/"):
-        key = request.client.host if request.client else "unknown"
+        xff = request.headers.get("x-forwarded-for", "")
+        key = (
+            xff.split(",")[0].strip()
+            or (request.client.host if request.client else "unknown")
+        )
         if not limiter.allow(key):
             return JSONResponse(
                 status_code=429,
@@ -94,18 +106,37 @@ def info() -> dict:
     }
 
 
-@app.get("/health", tags=["meta"])
-def health() -> dict:
+_health_lock = Lock()
+_health_ts = 0.0
+_health_value = False
+
+
+def _check_workers() -> bool:
+    # Cache the Celery ping for 5s so cold broker connections do not
+    # push /health past Render's health-check budget.
+    global _health_ts, _health_value
+    now = time()
+    with _health_lock:
+        if now - _health_ts < 5.0:
+            return _health_value
     try:
         pong = celery.control.ping(timeout=0.5)
-        workers_online = len(pong) > 0
+        value = len(pong) > 0
     except Exception as exc:
         logger.warning("Celery ping failed: %s", exc)
-        workers_online = False
+        value = False
+    with _health_lock:
+        _health_ts = now
+        _health_value = value
+    return value
+
+
+@app.get("/health", tags=["meta"])
+def health() -> dict:
     return {
         "status": "ok",
         "environment": settings.environment,
-        "celery_workers": workers_online,
+        "celery_workers": _check_workers(),
     }
 
 

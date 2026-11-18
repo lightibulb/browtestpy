@@ -10,12 +10,27 @@ from app.tasks.layer1 import check_dns, check_stun, get_public_ip
 from app.tasks.layer2 import collect_fingerprint
 
 
+def _persist_result(scan_id, result):
+    # Store the full result so it survives Celery's result_expires TTL.
+    try:
+        import redis
+        from app.core.config import settings
+        r = redis.from_url(settings.result_backend)
+        r.setex(
+            "scan_result:" + scan_id,
+            86400 * 7,
+            json.dumps(result, default=str),
+        )
+    except Exception:
+        pass
+
+
 def _record_history(scan_id, summary):
     # Best-effort history append. Failure here must not fail the scan.
     try:
         import redis
         from app.core.config import settings
-        r = redis.from_url(settings.redis_url)
+        r = redis.from_url(settings.result_backend)
         r.lpush("scan_history", scan_id)
         r.ltrim("scan_history", 0, 99)
         r.setex(
@@ -44,6 +59,7 @@ def execute_full_scan(self, proxy_url=None):
     result = {
         "scan_id": self.request.id,
         "timestamp": time.time(),
+        "proxy_url": proxy_url,
         "verdict": analysis["verdict"],
         "score": analysis["score"],
         "findings": analysis["findings"],
@@ -53,6 +69,7 @@ def execute_full_scan(self, proxy_url=None):
         "geo": geo,
     }
 
+    _persist_result(self.request.id, result)
     _record_history(self.request.id, {
         "verdict": result["verdict"],
         "score": result["score"],

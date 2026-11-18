@@ -75,8 +75,8 @@
   <div class="card">
     <h2>Local agent report</h2>
     <p>Run <code>python agent/leakguard_agent.py --report &lt;this-url&gt;</code>
-       on your machine, then paste the returned agent_id here.</p>
-    <input id="agent-id" placeholder="agent_id (or scan_id to attach)">
+       on your machine, then paste the returned scan_id here.</p>
+    <input id="agent-id" placeholder="scan_id (from agent output)">
     <button class="secondary" onclick="loadAgent()">Load agent report</button>
     <div id="agent-result"></div>
   </div>
@@ -302,9 +302,20 @@ async function loadHistory() {
 }
 
 async function loadScan(id) {
-  const res = await fetch('/api/v1/scan/' + id);
-  const data = await res.json();
-  if (data.status === 'complete') render(data.result, id);
+  try {
+    const res = await fetch('/api/v1/scan/' + id);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    if (data.status === 'complete') {
+      render(data.result, id);
+    } else if (data.status === 'failed') {
+      setStatus('Failed: ' + (data.error || 'unknown'), 'error');
+    } else {
+      setStatus('Scan ' + id.slice(0, 8) + ' is ' + data.status, 'running');
+    }
+  } catch (e) {
+    setStatus('Load error: ' + e.message, 'error');
+  }
 }
 
 loadHistory();
